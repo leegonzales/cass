@@ -17917,7 +17917,7 @@ impl super::ftui_adapter::Model for CassApp {
                             .constraints([Constraint::Fixed(1), Constraint::Min(1)])
                             .split(query_inner)
                     } else {
-                        vec![query_inner]
+                        smallvec::smallvec![query_inner]
                     };
 
                     let query_row = rows[0];
@@ -18554,7 +18554,7 @@ impl super::ftui_adapter::Model for CassApp {
                             .constraints([Constraint::Fixed(1), Constraint::Min(1)])
                             .split(header_inner)
                     } else {
-                        vec![header_inner]
+                        smallvec::smallvec![header_inner]
                     };
 
                     let tab_line = self.analytics_tabs_line(
@@ -19417,6 +19417,7 @@ pub fn build_resize_config(
             enabled: true,
             destination: EvidenceSinkDestination::file(&evidence_path),
             flush_on_write: false, // batch flush for lower I/O overhead
+            max_bytes: ftui::runtime::evidence_sink::DEFAULT_MAX_EVIDENCE_BYTES,
         }
     };
 
@@ -34763,6 +34764,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             enabled: true,
             destination: EvidenceSinkDestination::file(&evidence_path),
             flush_on_write: false,
+            max_bytes: ftui::runtime::evidence_sink::DEFAULT_MAX_EVIDENCE_BYTES,
         };
 
         assert!(config.enabled);
