@@ -10,6 +10,8 @@ pub mod ftui_harness;
 pub mod html_export;
 pub mod indexer;
 pub mod model;
+#[cfg(unix)]
+pub mod monitor;
 pub mod pages;
 pub mod search;
 pub mod sources;
@@ -886,6 +888,22 @@ pub enum Commands {
         /// Override data dir for model storage
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Live monitoring of active Claude Code instances
+    #[cfg(unix)]
+    Monitor {
+        /// Output as streaming JSON (one snapshot per line)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Refresh interval in seconds
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+
+        /// Snapshot once and exit (no live updates)
+        #[arg(long)]
+        once: bool,
     },
 }
 
@@ -3651,6 +3669,14 @@ async fn execute_cli(
                 } => {
                     run_daemon(socket, idle_timeout, max_connections, data_dir)?;
                 }
+                #[cfg(unix)]
+                Commands::Monitor {
+                    json,
+                    interval,
+                    once,
+                } => {
+                    monitor::run_monitor(json, interval, once)?;
+                }
                 _ => {}
             }
         }
@@ -5709,6 +5735,8 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Pages { .. }) => "pages".to_string(),
         #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
+        #[cfg(unix)]
+        Some(Commands::Monitor { .. }) => "monitor".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
@@ -5802,6 +5830,8 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         },
         Commands::Models(_) => cli.robot_format.is_some() || env_robot_mode,
         Commands::Analytics(cmd) => analytics_requests_structured_output(cmd, cli),
+        #[cfg(unix)]
+        Commands::Monitor { json, .. } => *json || env_robot_mode,
         _ => false,
     }
 }
