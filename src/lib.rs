@@ -3669,14 +3669,6 @@ async fn execute_cli(
                 } => {
                     run_daemon(socket, idle_timeout, max_connections, data_dir)?;
                 }
-                #[cfg(unix)]
-                Commands::Monitor {
-                    json,
-                    interval,
-                    once,
-                } => {
-                    monitor::run_monitor(json, interval, once)?;
-                }
                 _ => {}
             }
         }
@@ -3923,6 +3915,14 @@ async fn execute_cli(
                 }
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
+                }
+                #[cfg(unix)]
+                Commands::Monitor {
+                    json,
+                    interval,
+                    once,
+                } => {
+                    monitor::run_monitor(json, interval, once)?;
                 }
                 _ => {}
             }
