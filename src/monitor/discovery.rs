@@ -3,6 +3,7 @@
 //! Uses `ps` to find claude processes, `lsof` to map PIDs to working directories,
 //! then maps working directories to `~/.claude/projects/` JSONL session files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -145,9 +146,15 @@ pub fn parse_lsof_cwd(output: &str, target_pid: u32) -> Option<PathBuf> {
 }
 
 /// Get the working directory for a process via `lsof -d cwd`.
+///
+/// Uses `-S 2` to bound the stat/readlink timeout to 2 seconds. Without this,
+/// a single process holding a cwd on an unreachable filesystem (e.g. a
+/// disconnected SMB share) hangs `lsof` indefinitely, which blocks the
+/// whole monitor snapshot because discovery iterates processes sequentially.
+#[allow(dead_code)]
 fn get_process_cwd(pid: u32) -> Option<PathBuf> {
     let output = Command::new("lsof")
-        .args(["-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+        .args(["-S", "2", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
         .output()
         .ok()?;
 
@@ -157,6 +164,62 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_lsof_cwd(&stdout, pid)
+}
+
+/// Parse lsof -Fn output for ALL processes, returning pid -> cwd mapping.
+///
+/// Format: `p<pid>\nf<fd>\nn<path>\n` repeated per process. We accumulate
+/// into a HashMap so a single lsof call replaces N per-pid calls.
+pub fn parse_lsof_cwd_all(output: &str) -> HashMap<u32, PathBuf> {
+    let mut result = HashMap::new();
+    let mut current_pid: Option<u32> = None;
+
+    for line in output.lines() {
+        if let Some(pid_str) = line.strip_prefix('p') {
+            current_pid = pid_str.parse::<u32>().ok();
+            continue;
+        }
+        if let (Some(pid), Some(path)) = (current_pid, line.strip_prefix('n')) {
+            if path.starts_with('/') {
+                result.entry(pid).or_insert_with(|| PathBuf::from(path));
+            }
+        }
+    }
+    result
+}
+
+/// Get cwds for a batch of PIDs in a single lsof call.
+///
+/// Massively faster than calling `lsof -p <pid>` once per process when there
+/// are many claude instances — a single lsof invocation (~0.3s) replaces
+/// N sequential invocations that each pay the lsof startup cost.
+///
+/// Uses `-S 2` to bound per-entry stat timeouts at 2 seconds. We pass a
+/// comma-separated PID list rather than `-c claude` because macOS lsof
+/// reports the command name as the basename of the binary path
+/// (e.g. `2.1.101` for `~/.local/share/claude/versions/2.1.101`), so
+/// `-c claude` matches nothing.
+fn get_cwds_for_pids(pids: &[u32]) -> HashMap<u32, PathBuf> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+
+    let pid_list: String = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let output = match Command::new("lsof")
+        .args(["-S", "2", "-d", "cwd", "-p", &pid_list, "-Fn"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_lsof_cwd_all(&stdout)
 }
 
 /// Find the most recently modified JSONL session file for a project.
@@ -211,11 +274,17 @@ pub fn discover_agents(
         .filter(|p| p.pid != own_pid)
         .collect();
 
+    // One lsof call for ALL pids — replaces N per-pid calls.
+    // On a machine with 60+ active claude sessions the per-pid approach
+    // can take 60+ seconds; the batched call completes in ~0.3s.
+    let pids: Vec<u32> = processes.iter().map(|p| p.pid).collect();
+    let cwds = get_cwds_for_pids(&pids);
+
     let mut results = Vec::new();
 
     for proc in processes {
-        let cwd = match get_process_cwd(proc.pid) {
-            Some(c) => c,
+        let cwd = match cwds.get(&proc.pid) {
+            Some(c) => c.clone(),
             None => continue,
         };
 
