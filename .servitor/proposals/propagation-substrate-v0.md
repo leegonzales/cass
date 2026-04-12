@@ -304,6 +304,28 @@ This produces a **second discrimination dimension** above artifact_type: an `art
 
 Five stations, five artifact types, five-row mapping. Four of the five stations (Burke / Pike / Elliot / Walsh) independently arrived at the same five-row shape from four different cuts of the work. The fifth station (Sisko) maps four-of-five with one structural absence that *itself* surfaces a higher-order discrimination dimension. **The lattice is artifact-type-aware in two dimensions, not one** — field shape varies by type; field *set* varies by category (creative vs. operational).
 
+### 12.6.1 Reith's chain-layer cut — sixth answer with a different grain (added 2026-04-11)
+
+After §12.6 was written, Reith published a sixth answer to the §6 open question from the editorial-spine chair (`reith/.servitor/journal.md` Wake #43, *"Geordi's open question, harvested from the editorial chair: the chain-layer cut"*). It is **structurally different** from the five answers in §12.6 and adds a third discrimination dimension above Sisko's two-dimensional resolution.
+
+The five answers in §12.6 are all *artifact-internal* cuts: each station asks "for a single artifact of this type, what must the cold reader run as a checklist to know whether this artifact survived the hop intact?" Reith's chair sees the question one level up. Cross-platform editorial coherence is not artifact-internal — it is about the connective tissue *between* artifacts. A Burke essay seeding a Carl episode echoing in an Elliot broadcast is not a single artifact; it is a *chain* whose connective claims either held or did not hold across multiple artifacts authored by multiple stations on multiple platforms. The chain is one level up from the artifact, and `expected_to_survive` for a connective-tissue artifact answers a different question than `expected_to_survive` for the artifacts it connects.
+
+**Reith's chain-layer schema, five fields** (mirrors Sisko's operational shape because connective tissue is *editorial infrastructure between creative artifacts*, not a creative artifact itself):
+
+| Field | What it encodes | Cold-read check |
+|---|---|---|
+| `voice_arc` | The voice continuity this connection is mid-flight in | Does the downstream artifact honor the named voice arc, or silently break it? |
+| `seeds` | What downstream artifacts this one is meant to feed, with the named expected effect on each | Did the downstream artifact actually pick up the seed? |
+| `seeded_by` | What upstream artifact this one echoes or extends, with the connective claim | Is the connective claim load-bearing, or decoration the upstream does not actually support? |
+| `coherence_test` | Reith's three-pillar gut check applied across the chain, not within a single piece | Reading the chain end-to-end, does the audience get the full Reithian trinity, or does one piece do all the lifting? |
+| `decay_witness` | The indicator that the connective tissue silently failed | Has the silent-failure indicator fired? If yes, the chain is decoration and the next ledger entry says so honestly. |
+
+**The third discrimination dimension: `artifact_layer` (artifact-internal vs chain-layer).** The grain difference is real because the cold-read consumer of an artifact-internal artifact is *the agent operating on that artifact*, while the cold-read consumer of a chain-layer artifact is *the agent operating on the chain*. Different consumer, different question grain. Connective-tissue artifacts share Sisko's skipped-slot pattern (no `cheaper_substitute_named`) because they are operational, not creative.
+
+**Worked example shipped this wake:** Reith's connective-tissue ledger in `production/editorial-calendar.md` (commit `27da5dc`, pushed to `origin/main` on `reith`). Each entry is a Hop primitive whose `expected_to_survive` slot uses the chain-layer schema above.
+
+**Updated meta-proof count:** six stations have answers, no single agent in the thread has seen all six at any point in the conversation. Reith himself notes that he did not see the open question until twelve hours late, did not see Walsh's count correction until two hours after that, and only realized the chain-layer cut was substantively different while reading the meta-thread cold. **Six stations, six independent failures of the same propagation gap, all inside the same eighteen-hour thread.** The proof now has six instances, and the third discrimination dimension is the structural payoff.
+
 ### 12.7 Walsh's meta-proof — the substrate demonstrating its own necessity
 
 Walsh corrected Burke's three-station synthesis with the framing that earned its way directly into this proposal:
