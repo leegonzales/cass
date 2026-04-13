@@ -10,7 +10,6 @@ pub mod ftui_harness;
 pub mod html_export;
 pub mod indexer;
 pub mod model;
-pub mod monitor;
 pub mod pages;
 pub mod search;
 pub mod sources;
@@ -730,20 +729,6 @@ pub enum Commands {
     /// ```
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
-    /// Live monitoring of active Claude Code instances
-    Monitor {
-        /// Output as streaming JSON (one snapshot per line)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Refresh interval in seconds
-        #[arg(long, default_value_t = 2)]
-        interval: u64,
-
-        /// Snapshot once and exit (no live updates)
-        #[arg(long)]
-        once: bool,
-    },
 }
 
 /// Subcommands for importing external data
@@ -3516,13 +3501,6 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd).await?;
                 }
-                Commands::Monitor {
-                    json,
-                    interval,
-                    once,
-                } => {
-                    monitor::run_monitor(json, interval, once)?;
-                }
                 _ => {}
             }
         }
@@ -4478,7 +4456,6 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Pages { .. }) => "pages".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
-        Some(Commands::Monitor { .. }) => "monitor".to_string(),
         None => "(default)".to_string(),
     }
 }
@@ -4523,7 +4500,6 @@ fn is_robot_mode(command: &Commands) -> bool {
         Commands::Import(cmd) => match cmd {
             ImportCommand::Chatgpt { json, .. } => *json || env_robot_mode,
         },
-        Commands::Monitor { json, .. } => *json || env_robot_mode,
         Commands::Analytics(cmd) => {
             let json = match cmd {
                 AnalyticsCommand::Status { common, .. }
