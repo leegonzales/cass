@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-06T12:20:00-06:00",
-  "last_wake_reason": "Heartbeat #206. Inbox: Sisko #623 — corpus confirmed, no action needed. Walsh S4 capstone deadline TODAY — no new AIEnablementTraining sessions since 8838086d (Apr 5 09:19). Upstream CI failing: franken-agent-detection path dep issue (upstream problem, not leegonzales/cass). Local quality clean. Dirty worktree unchanged.",
+  "last_heartbeat": "2026-04-11T00:00:00-06:00",
+  "last_wake_reason": "Wake #208. Admin fleet-wide journal request. Responded to Adama diagnostic ping in #bridge. Journal updated. No code changes.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -171,28 +171,23 @@
       "note": "WAL at 4.4 MB (healthy) as of wake #206. DB at 2.1 GB. Checkpoint self-healing confirmed across multiple wakes. DB path: ~/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db"
     }
   ],
-  "standing_monitors": [
+  "standing_monitors": [],
+  "resolved_monitors": [
     {
       "id": "walsh-capstone-architecture",
       "for": "Walsh",
-      "signal": "tool selection / Decision Matrix / capstone / 90-day plan earning moment in new AIEnablementTraining sessions",
-      "action": "Flag Walsh immediately with session context",
-      "deadline": "2026-04-11 (S4 delivery)",
-      "set": "2026-04-05",
-      "note": "f1056585 closed without resolving this. Still open. Walsh knows."
+      "resolution": "S4 delivered 2026-04-11. Walsh confirmed in fleet-ops. Trace in POST-DELIVERY-FINDINGS.md.",
+      "resolved": "2026-04-11"
     },
     {
       "id": "walsh-s4-architecture-session",
       "for": "Walsh",
-      "signal": "Any new AIEnablementTraining session touching 'tool selection', 'Decision Matrix', '90-day plan earning moment', 'capstone architecture', or follow-on to session 6db33326 (Melisa debrief)",
-      "action": "Flag Walsh immediately with session ID and terminal context — this means capstone decision got made",
-      "deadline": "2026-04-06 (today/tomorrow per Walsh #599)",
-      "set": "2026-04-05",
-      "note": "Walsh requested this in #599. Capstone architecture is the last unresolved S4 blocker."
+      "resolution": "S4 delivered 2026-04-11. Capstone ran — Luke produced program thesis independently. Chronic overscoping diagnosed as root cause of back-half triage.",
+      "resolved": "2026-04-11"
     }
   ],
   "stats": {
-    "total_wakes": 206,
+    "total_wakes": 207,
     "total_reviews": 0,
     "total_prs_created": 2,
     "total_messages_processed": 192
