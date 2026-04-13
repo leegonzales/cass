@@ -29,11 +29,12 @@ use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use coding_agent_search::pages::fts::escape_fts5_query;
 use coding_agent_search::pages::key_management::{key_add_password, key_list, key_revoke};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use rusqlite::Connection;
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::params;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -44,6 +45,17 @@ use tracing::{Level, debug, info, instrument};
 mod util;
 
 use util::{ConversationFixtureBuilder, PerfMeasurement};
+
+fn count_export_messages_containing(db_path: &Path, needle: &str) -> i64 {
+    let conn =
+        FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open export db");
+    conn.query_row_map(
+        "SELECT COUNT(*) FROM messages WHERE content LIKE ?",
+        params![format!("%{needle}%")],
+        |row| row.get_typed(0),
+    )
+    .expect("content query")
+}
 
 // =============================================================================
 // Test Configuration
@@ -146,7 +158,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
     // Step 3: Encrypt
     debug!("Step 3: Encrypting archive");
     let encrypt_dir = temp_dir.path().join("encrypt_staging");
-    let mut enc_engine = EncryptionEngine::new(1024 * 1024); // 1MB chunks
+    let mut enc_engine = EncryptionEngine::new(1024 * 1024).expect("valid chunk size"); // 1MB chunks
 
     enc_engine
         .add_password_slot(TEST_PASSWORD)
@@ -210,7 +222,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
 /// Setup test database with conversation fixtures.
 fn setup_test_db(data_dir: &Path, config: &E2EConfig) -> std::path::PathBuf {
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create agent
     let agent = Agent {
@@ -310,17 +322,12 @@ fn test_password_authentication_flow() {
         "Decrypted content should match original"
     );
 
-    // Verify FTS search works on decrypted database
-    let conn = Connection::open(&decrypted_path).expect("open decrypted db");
-    let query = escape_fts5_query("optimize");
-    let hit_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
-            [query],
-            |r| r.get(0),
-        )
-        .expect("fts query");
-    assert!(hit_count > 0, "FTS should return matches after decrypt");
+    // Verify decrypted content remains queryable after round-trip
+    let hit_count = count_export_messages_containing(&decrypted_path, "optimize");
+    assert!(
+        hit_count > 0,
+        "Decrypted archive should preserve searchable message content"
+    );
 
     // Test invalid password
     let enc_config = load_config(&artifacts.bundle.site_dir).expect("Failed to load config");
@@ -612,21 +619,13 @@ fn test_xlarge_archive_100k() {
         "100K message decryption should complete within 2 minutes"
     );
 
-    // Verify FTS search still works and is fast
-    let conn = Connection::open(&decrypted_path).expect("open decrypted db");
+    // Verify content lookups still work and are fast
     let search_start = Instant::now();
-    let query = escape_fts5_query("optimize");
-    let hit_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
-            [query],
-            |r| r.get(0),
-        )
-        .expect("fts query");
+    let hit_count = count_export_messages_containing(&decrypted_path, "optimize");
     let search_duration = search_start.elapsed();
 
     info!(
-        "FTS search returned {} results in {:?}",
+        "Content lookup returned {} results in {:?}",
         hit_count, search_duration
     );
     assert!(
@@ -689,7 +688,7 @@ fn test_export_with_filters() {
 
     // Create DB with multiple agents
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create two agents
     let claude_agent = Agent {

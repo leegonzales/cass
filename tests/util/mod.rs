@@ -1,4 +1,5 @@
 pub mod e2e_log;
+pub mod search_asset_simulation;
 
 // =============================================================================
 // Verbose Logging Support
@@ -569,6 +570,7 @@ impl ConversationFixtureBuilder {
                     content,
                     extra: json!({"seed": i}),
                     snippets,
+                    invocations: Vec::new(),
                 }
             })
             .collect();

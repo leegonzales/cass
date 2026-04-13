@@ -355,13 +355,14 @@ fn test_wizard_state_final_site_dir_tracking() {
 // These tests use the actual fixture database at:
 //   tests/fixtures/search_demo_data/agent_search.db
 //
-// The fixture contains:
-//   - Agents: claude_code, gemini, opencode
-//   - 4 conversations with real message data
-//   - FTS tables for full-text search
+// The fixture is intentionally treated as a moving real-data sample rather
+// than a frozen golden snapshot. The tests should validate that it is
+// non-empty and exportable without hard-coding a specific agent roster.
 
 use coding_agent_search::pages::config_input::PagesConfig;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection;
 
 /// Returns the path to the fixture database
@@ -402,7 +403,10 @@ fn test_wizard_with_real_fixture_database() {
         .collect();
 
     assert!(!agents.is_empty(), "Should have agents in fixture");
-    assert!(agents.contains(&"claude_code".to_string()));
+    assert!(
+        agents.iter().all(|agent| !agent.trim().is_empty()),
+        "Fixture agents should all have non-empty slugs"
+    );
 
     // Query conversations
     let conv_count: i64 = conn
@@ -449,8 +453,9 @@ fn test_export_with_real_fixture_all_agents() {
     assert_eq!(conv_count as usize, stats.conversations_processed);
 
     // Verify FTS table was created
-    let fts_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+    let fts_conn = FrankenConnection::open(output_path.to_string_lossy().into_owned()).unwrap();
+    let fts_count: i64 = fts_conn
+        .query_row_map("SELECT COUNT(*) FROM messages_fts", &[], |r| r.get_typed(0))
         .unwrap();
     assert!(fts_count > 0, "Should have FTS entries");
 }
@@ -526,6 +531,37 @@ fn test_export_with_real_fixture_nonexistent_agent() {
     assert_eq!(stats.messages_processed, 0);
 
     // Output database should still be valid with schema
+    let conn = Connection::open(&output_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_export_with_real_fixture_explicit_empty_workspace_filter() {
+    let _tracker = PhaseTracker::new("pages_wizard", "export_real_fixture_empty_workspace_filter");
+
+    let db_path = fixture_db_path();
+    let tmp = TempDir::new().unwrap();
+    let output_path = tmp.path().join("export.db");
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: Some(vec![]),
+        since: None,
+        until: None,
+        path_mode: PathMode::Relative,
+    };
+
+    let engine = ExportEngine::new(&db_path, &output_path, filter);
+    let stats = engine
+        .execute(|_, _| {}, None)
+        .expect("Export should succeed even with an explicit empty workspace filter");
+
+    assert_eq!(stats.conversations_processed, 0);
+    assert_eq!(stats.messages_processed, 0);
+
     let conn = Connection::open(&output_path).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
@@ -677,8 +713,9 @@ fn test_wizard_state_with_fixture_export_flow() {
         assert_eq!(conv_count as usize, stats.conversations_processed);
 
         // Verify messages were exported
-        let msg_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        let fts_conn = FrankenConnection::open(output_db.to_string_lossy().into_owned()).unwrap();
+        let msg_count: i64 = fts_conn
+            .query_row_map("SELECT COUNT(*) FROM messages_fts", &[], |r| r.get_typed(0))
             .unwrap();
         assert!(msg_count >= 0);
     }

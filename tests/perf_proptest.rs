@@ -87,6 +87,7 @@ fn make_hit(id: &str, score: f32) -> SearchHit {
         source_id: "local".to_string(),
         origin_kind: "local".to_string(),
         origin_host: None,
+        conversation_id: None,
     }
 }
 
@@ -173,8 +174,8 @@ proptest! {
             .map(|(i, score)| make_hit(&format!("S{i}"), *score * 0.5))
             .collect();
 
-        let a = rrf_fuse_hits(&lexical, &semantic, TOP_K, 0);
-        let b = rrf_fuse_hits(&lexical, &semantic, TOP_K, 0);
+        let a = rrf_fuse_hits(&lexical, &semantic, "", TOP_K, 0);
+        let b = rrf_fuse_hits(&lexical, &semantic, "", TOP_K, 0);
 
         let keys_a: Vec<(String, Option<usize>)> = a
             .iter()

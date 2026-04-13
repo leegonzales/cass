@@ -56,11 +56,15 @@ cass health --json || cass index --full
 # 2) Search across all agent history
 cass search "authentication error" --robot --limit 5 --fields minimal
 
-# 3) View + expand a hit (use source_path/line_number from search output)
+# 3) Find the current or recent session for this workspace
+cass sessions --current --json
+cass sessions --workspace "$(pwd)" --json --limit 5
+
+# 4) View + expand a hit (use source_path/line_number from search output)
 cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
-# 4) Discover the full machine API
+# 5) Discover the full machine API
 cass robot-docs guide
 cass robot-docs schemas
 ```
@@ -745,6 +749,12 @@ The `retryable` field tells agents whether a retry might succeed (e.g., transien
 Beyond search, `cass` provides commands for deep-diving into specific sessions:
 
 ```bash
+# Discover the current session for this workspace
+cass sessions --current --json
+
+# List recent sessions for a specific project
+cass sessions --workspace /path/to/project --json --limit 5
+
 # Export full conversation to shareable format
 cass export /path/to/session.jsonl --format markdown -o conversation.md
 cass export /path/to/session.jsonl --format json --include-tools
@@ -753,6 +763,9 @@ cass export /path/to/session.jsonl --format json --include-tools
 cass export-html /path/to/session.jsonl                     # To Downloads folder
 cass export-html session.jsonl --encrypt --password "pwd"   # With password protection
 cass export-html session.jsonl --open --json                # Open in browser, JSON output
+
+# Common agent flow: find current session, then export it
+cass export-html "$(cass sessions --current --json | jq -r '.sessions[0].path')" --json
 
 # Expand context around a specific line (from search result)
 cass expand /path/to/session.jsonl -n 42 -C 5 --json
@@ -2087,6 +2100,7 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: x86_64 processor with **AVX** instruction support (any Intel/AMD CPU from ~2011 onwards). The ONNX Runtime dependency used for semantic search requires AVX instructions. On CPUs without AVX support, the binary will crash with a `SIGILL` (illegal instruction) signal. The `cass` binary includes a runtime check and will print a clear error message if AVX is not detected, but note that ONNX Runtime may be loaded before this check in some code paths.
 - **OS**: Linux, macOS, or Windows
+- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
@@ -2236,6 +2250,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
 | `capabilities` | Discover features, versions, limits (for agent introspection) |
 | `introspect` | Full API schema: commands, arguments, response shapes |
+| `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
 | `export <path>` | Export conversation to markdown/JSON |
@@ -2549,6 +2564,27 @@ Update check state is stored in the data directory:
 | `GEMINI_HOME` | `~/.gemini` | Gemini CLI directory |
 | `OPENCODE_STORAGE_ROOT` | (scans home) | OpenCode storage |
 | `CHATGPT_ENCRYPTION_KEY` | unset | Base64-encoded AES key for ChatGPT v2/v3 |
+
+---
+
+## Sibling Dependency Contract
+
+`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite` and `franken-agent-detection`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
+
+**Build-time validation**
+- `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
+- If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
+- Enable strict enforcement with `cargo check --features strict-path-dep-validation` or `CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+
+**Expected interface contract**
+- `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
+- `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
+- `frankensearch`: `lexical::cass_open_search_reader`, `lexical::ReloadPolicy`, `ModelCategory`, and `ModelTier`.
+- `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
+- `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
+- `toon` (`tru`): `toon::encode(...)`.
+
+When intentionally updating one of these sibling crates, update the manifest pin, the `build.rs` contract, and the compile-contract test together.
 
 ---
 

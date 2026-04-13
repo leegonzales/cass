@@ -85,8 +85,10 @@ impl Default for EncryptionParams {
 /// matching the Web Crypto API implementation in scripts.rs.
 ///
 /// # Note
-/// This is a placeholder implementation. For production use,
-/// integrate with a proper crypto library like `ring` or `aes-gcm`.
+/// This is the production encryption path for feature-enabled HTML export.
+/// It intentionally uses the same algorithm and parameter contract as the
+/// browser-side Web Crypto decryptor so exported pages can be decrypted
+/// client-side without a server round-trip.
 #[cfg(feature = "encryption")]
 pub fn encrypt_content(
     plaintext: &str,
@@ -144,8 +146,8 @@ pub fn encrypt_content(
 
     let derive_started = Instant::now();
     // Derive key using PBKDF2-SHA256
-    let mut key = [0u8; 32]; // 256 bits for AES-256
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut key);
+    let mut key = zeroize::Zeroizing::new([0u8; 32]); // 256 bits for AES-256
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut *key);
     debug!(
         component = "encryption",
         operation = "derive_key",
@@ -154,7 +156,7 @@ pub fn encrypt_content(
     );
 
     // Encrypt with AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
     let nonce = Nonce::from_slice(&iv);
@@ -323,6 +325,30 @@ mod tests {
         let decrypted = cipher.decrypt(nonce, ciphertext.as_ref()).expect("decrypt");
 
         assert_eq!(plaintext, String::from_utf8(decrypted).expect("utf8"));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypt_content_produces_authenticated_ciphertext() {
+        let params = EncryptionParams {
+            iterations: 1_000,
+            salt_len: 16,
+            iv_len: 12,
+        };
+        let result = encrypt_content("sensitive data", "strong-password-here", &params)
+            .expect("feature-enabled encrypt_content should produce ciphertext");
+
+        assert!(!result.salt.is_empty(), "salt must be generated");
+        assert!(!result.iv.is_empty(), "iv must be generated");
+        assert_ne!(
+            result.ciphertext, "sensitive data",
+            "ciphertext must differ from plaintext"
+        );
+        assert!(
+            result.ciphertext.len() > "sensitive data".len(),
+            "ciphertext should include authenticated-encryption overhead"
+        );
+        assert_eq!(result.iterations, params.iterations);
     }
 
     #[test]

@@ -9,8 +9,12 @@
 //!
 //! All tests use real Tantivy indexes and SQLite metadata - no mocks.
 
-use coding_agent_search::search::query::{FieldMask, MatchType, SearchClient, SearchFilters};
+use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
+use coding_agent_search::search::query::{
+    FieldMask, MatchType, SearchClient, SearchFilters, SearchHit,
+};
 use coding_agent_search::search::tantivy::TantivyIndex;
+use serde_json::json;
 use tempfile::TempDir;
 
 mod util;
@@ -613,8 +617,12 @@ fn title_field_is_searchable() {
 fn empty_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
     let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let source_path = dir.path().join("empty-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
+        .title("empty query title")
+        .source_path(source_path.clone())
+        .messages(1)
         .with_content(0, "some content")
         .build_normalized();
 
@@ -626,9 +634,15 @@ fn empty_query_does_not_panic() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // Empty query should not panic - behavior may vary (returns all or none)
-    let result = client.search("", filters, 10, 0, FieldMask::FULL);
-    assert!(result.is_ok(), "empty query should not error or panic");
+    let hits = client.search("", filters, 10, 0, FieldMask::FULL).unwrap();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "empty query should surface indexed conversations"
+    );
+    assert_eq!(hits[0].source_path, source_path);
+    assert_eq!(hits[0].title, "empty query title");
 }
 
 /// Whitespace-only query behavior is implementation-defined.
@@ -636,8 +650,12 @@ fn empty_query_does_not_panic() {
 fn whitespace_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
     let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let source_path = dir.path().join("whitespace-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
+        .title("whitespace query title")
+        .source_path(source_path)
+        .messages(1)
         .with_content(0, "some content")
         .build_normalized();
 
@@ -649,9 +667,31 @@ fn whitespace_query_does_not_panic() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // Whitespace query should not panic - behavior may vary
-    let result = client.search("   ", filters, 10, 0, FieldMask::FULL);
-    assert!(result.is_ok(), "whitespace query should not error or panic");
+    let empty_hits = client
+        .search("", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let whitespace_hits = client
+        .search("   ", filters, 10, 0, FieldMask::FULL)
+        .unwrap();
+
+    let summarize = |hits: &[SearchHit]| {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.title.clone(),
+                    hit.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        summarize(&whitespace_hits),
+        summarize(&empty_hits),
+        "whitespace-only queries should behave the same as empty queries"
+    );
 }
 
 /// Special characters in query are handled gracefully.
@@ -676,12 +716,33 @@ fn special_characters_handled() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // These should not panic
-    let _ = client.search("c++", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("std::vector", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("foo::bar", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("(test)", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("[brackets]", filters.clone(), 10, 0, FieldMask::FULL);
+    let std_hits = client
+        .search("std::vector", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let foo_hits = client
+        .search("foo::bar", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+
+    assert_eq!(
+        std_hits.len(),
+        1,
+        "namespaced queries should still find the document"
+    );
+    assert_eq!(
+        foo_hits.len(),
+        1,
+        "double-colon code tokens should still find the document"
+    );
+    assert_eq!(std_hits[0].title, "special chars");
+    assert_eq!(foo_hits[0].title, "special chars");
+
+    for query in ["c++", "(test)", "[brackets]"] {
+        client
+            .search(query, filters.clone(), 10, 0, FieldMask::FULL)
+            .unwrap_or_else(|err| {
+                panic!("query {query:?} should be sanitized without error: {err}")
+            });
+    }
 }
 
 /// Query with only wildcards.
@@ -702,10 +763,29 @@ fn only_wildcard_query() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // "*" alone should be handled (may return all or none depending on implementation)
-    let result = client.search("*", filters, 10, 0, FieldMask::FULL);
-    // Should not panic regardless of what it returns
-    assert!(result.is_ok(), "wildcard-only query should not panic");
+    let first = client
+        .search("*", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let second = client.search("*", filters, 10, 0, FieldMask::FULL).unwrap();
+
+    let summarize = |hits: &[SearchHit]| {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.title.clone(),
+                    hit.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        summarize(&first),
+        summarize(&second),
+        "wildcard-only queries should be stable across repeated execution"
+    );
 }
 
 // =============================================================================
@@ -842,4 +922,205 @@ fn deduplication_removes_duplicates() {
     // Implementation may deduplicate or not - just verify no panic and sensible result
     assert!(!hits.is_empty(), "should find at least one result");
     assert!(hits.len() <= 2, "should have at most 2 results");
+}
+
+/// Lexical indexing should skip empty/whitespace/acknowledgement noise.
+#[test]
+fn indexing_skips_message_level_noise() {
+    let dir = TempDir::new().unwrap();
+    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+
+    let conv = NormalizedConversation {
+        agent_slug: "tester".into(),
+        external_id: Some("noise-indexing".into()),
+        title: Some("noise indexing".into()),
+        workspace: Some(dir.path().join("workspace")),
+        source_path: dir.path().join("noise-indexing.jsonl"),
+        started_at: Some(1000),
+        ended_at: Some(1004),
+        metadata: json!({}),
+        messages: vec![
+            NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(1000),
+                content: "Authentication refresh still fails after logout".into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 1,
+                role: "assistant".into(),
+                author: Some("assistant".into()),
+                created_at: Some(1001),
+                content: "   \n\t ".into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 2,
+                role: "tool".into(),
+                author: Some("tool".into()),
+                created_at: Some(1002),
+                content: "Acknowledged.".into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 3,
+                role: "tool".into(),
+                author: Some("tool".into()),
+                created_at: Some(1003),
+                content: "Successfully wrote to /tmp/auth.rs".into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+        ],
+    };
+
+    index.add_conversation(&conv).unwrap();
+    index.commit().unwrap();
+
+    let client = SearchClient::open(dir.path(), None)
+        .unwrap()
+        .expect("client");
+
+    let auth_hits = client
+        .search(
+            "authentication refresh",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert_eq!(auth_hits.len(), 1, "real message should remain searchable");
+
+    let ack_hits = client
+        .search(
+            "acknowledged",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert!(
+        ack_hits.is_empty(),
+        "acknowledgement noise should not be indexed"
+    );
+
+    let write_hits = client
+        .search(
+            "successfully wrote",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert!(
+        write_hits.is_empty(),
+        "tool acknowledgement noise should not be indexed"
+    );
+}
+
+/// Prompt-like system messages should be hidden by default but searchable when requested.
+#[test]
+fn search_hides_system_prompts_unless_query_requests_them() {
+    let dir = TempDir::new().unwrap();
+    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+
+    let conv = NormalizedConversation {
+        agent_slug: "tester".into(),
+        external_id: Some("system-prompt".into()),
+        title: Some("system prompt".into()),
+        workspace: Some(dir.path().join("workspace")),
+        source_path: dir.path().join("system-prompt.jsonl"),
+        started_at: Some(2000),
+        ended_at: Some(2001),
+        metadata: json!({}),
+        messages: vec![
+            NormalizedMessage {
+                idx: 0,
+                role: "system".into(),
+                author: Some("system".into()),
+                created_at: Some(2000),
+                content:
+                    "# AGENTS.md instructions for /repo\n\nYou are a coding assistant. Follow the instructions exactly."
+                        .into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 1,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(2001),
+                content: "Investigate the OAuth refresh bug".into(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            },
+        ],
+    };
+
+    index.add_conversation(&conv).unwrap();
+    index.commit().unwrap();
+
+    let client = SearchClient::open(dir.path(), None)
+        .unwrap()
+        .expect("client");
+
+    let hidden_hits = client
+        .search(
+            "coding assistant",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert!(
+        hidden_hits.is_empty(),
+        "prompt-like content should be hidden from normal search results"
+    );
+
+    let prompt_hits = client
+        .search(
+            "AGENTS.md instructions",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert_eq!(
+        prompt_hits.len(),
+        1,
+        "prompt query should surface the prompt content"
+    );
+    assert!(prompt_hits[0].content.contains("AGENTS.md instructions"));
+
+    let direct_prompt_hits = client
+        .search(
+            "you are a coding assistant",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )
+        .unwrap();
+    assert_eq!(
+        direct_prompt_hits.len(),
+        1,
+        "plain prompt text should also surface the hidden prompt content"
+    );
+    assert!(direct_prompt_hits[0].content.contains("coding assistant"));
 }

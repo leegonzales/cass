@@ -153,6 +153,7 @@ fn make_bench_hit(id: &str, score: f32) -> SearchHit {
         source_id: "local".to_string(),
         origin_kind: "local".to_string(),
         origin_host: None,
+        conversation_id: None,
     }
 }
 
@@ -169,7 +170,7 @@ fn bench_rrf_fusion_100_results(c: &mut Criterion) {
 
     c.bench_function("rrf_fusion_100_results", |b| {
         b.iter(|| {
-            let fused = rrf_fuse_hits(black_box(&lexical), black_box(&semantic), 25, 0);
+            let fused = rrf_fuse_hits(black_box(&lexical), black_box(&semantic), "", 25, 0);
             black_box(fused)
         })
     });
@@ -188,7 +189,7 @@ fn bench_rrf_fusion_overlapping(c: &mut Criterion) {
 
     c.bench_function("rrf_fusion_50pct_overlap", |b| {
         b.iter(|| {
-            let fused = rrf_fuse_hits(black_box(&lexical), black_box(&semantic), 25, 0);
+            let fused = rrf_fuse_hits(black_box(&lexical), black_box(&semantic), "", 25, 0);
             black_box(fused)
         })
     });

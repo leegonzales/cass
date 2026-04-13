@@ -114,7 +114,8 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(obj) => {
             let mut new_obj = serde_json::Map::new();
             for (k, v) in obj {
-                new_obj.insert(k.clone(), redact_json(v));
+                let redacted_key = redact_text(k);
+                new_obj.insert(redacted_key, redact_json(v));
             }
             serde_json::Value::Object(new_obj)
         }
@@ -136,6 +137,7 @@ pub fn redaction_enabled() -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn redacts_openai_key() {
@@ -232,10 +234,7 @@ mod tests {
             "number": 42
         });
         let output = redact_json(&input);
-        assert_eq!(
-            output["tool_result"],
-            json!("Response contains [REDACTED]")
-        );
+        assert_eq!(output["tool_result"], json!("Response contains [REDACTED]"));
         assert_eq!(output["safe"], json!("no secrets here"));
         assert_eq!(output["number"], json!(42));
     }
@@ -255,11 +254,25 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn redaction_enabled_default() {
         // When env var is not set, should be enabled
         // Safety: only called in single-threaded test context
         unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
         assert!(redaction_enabled());
+    }
+
+    #[test]
+    #[serial]
+    fn redaction_can_be_disabled() {
+        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
+        assert!(!redaction_enabled());
+
+        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "false") };
+        assert!(!redaction_enabled());
+
+        // Restore for other tests
+        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
     }
 
     #[test]

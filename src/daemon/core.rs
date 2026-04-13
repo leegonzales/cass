@@ -10,9 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
+use super::daemon_run_lock_path;
 use super::models::ModelManager;
 use super::protocol::{
     EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
@@ -191,6 +193,27 @@ impl ModelDaemon {
 
     /// Start the daemon server.
     pub fn run(&self) -> std::io::Result<()> {
+        // Use a file lock to ensure only one daemon instance runs for this socket path
+        let lock_path = daemon_run_lock_path(&self.config.socket_path);
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        // Acquire exclusive lock (non-blocking to fail fast if another daemon is already running)
+        if lock_file.try_lock_exclusive().is_err() {
+            warn!(
+                socket = %self.config.socket_path.display(),
+                "Another daemon is already running for this socket path"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "Another daemon is already running",
+            ));
+        }
+
         // Apply resource limits
         if !self.resources.apply_nice(self.config.nice_value) {
             warn!(
@@ -205,9 +228,11 @@ impl ModelDaemon {
             );
         }
 
-        // Remove stale socket if exists
-        if self.config.socket_path.exists() {
-            std::fs::remove_file(&self.config.socket_path)?;
+        // Remove stale socket if present (ignore NotFound — avoids TOCTOU race)
+        if let Err(e) = std::fs::remove_file(&self.config.socket_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e);
         }
 
         // Create parent directory if needed
@@ -216,6 +241,15 @@ impl ModelDaemon {
         }
 
         let listener = UnixListener::bind(&self.config.socket_path)?;
+        // Restrict socket to owner-only access (prevent other local users from
+        // connecting and issuing Shutdown / SubmitEmbeddingJob with arbitrary paths).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &self.config.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
         listener.set_nonblocking(true)?;
 
         info!(
@@ -237,63 +271,67 @@ impl ModelDaemon {
         // Start background embedding worker
         self.init_worker();
 
-        loop {
-            // Check for shutdown
-            if self.shutdown.load(Ordering::SeqCst) {
-                info!("Shutdown requested, stopping daemon");
-                break;
-            }
+        std::thread::scope(|s| {
+            loop {
+                // Check for shutdown
+                if self.shutdown.load(Ordering::SeqCst) {
+                    info!("Shutdown requested, stopping daemon");
+                    break;
+                }
 
-            // Check for idle shutdown
-            if self.should_shutdown_idle() {
-                info!(
-                    idle_secs = self.config.idle_timeout.as_secs(),
-                    "Idle timeout reached, shutting down"
-                );
-                break;
-            }
+                // Check for idle shutdown
+                if self.should_shutdown_idle() {
+                    info!(
+                        idle_secs = self.config.idle_timeout.as_secs(),
+                        "Idle timeout reached, shutting down"
+                    );
+                    break;
+                }
 
-            // Enforce configured memory limit when enabled.
-            if self.memory_limit_exceeded() {
-                let memory_bytes = self.resources.memory_usage();
-                error!(
-                    memory_bytes = memory_bytes,
-                    memory_limit = self.config.memory_limit,
-                    "Daemon memory limit exceeded, shutting down"
-                );
-                break;
-            }
+                // Enforce configured memory limit when enabled.
+                if self.memory_limit_exceeded() {
+                    let memory_bytes = self.resources.memory_usage();
+                    error!(
+                        memory_bytes = memory_bytes,
+                        memory_limit = self.config.memory_limit,
+                        "Daemon memory limit exceeded, shutting down"
+                    );
+                    break;
+                }
 
-            // Accept new connections
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    let active = self.active_connections.fetch_add(1, Ordering::SeqCst);
-                    if active >= self.config.max_connections as u64 {
-                        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-                        warn!(
-                            active = active,
-                            max = self.config.max_connections,
-                            "Max connections reached, rejecting"
-                        );
-                        continue;
+                // Accept new connections
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let active = self.active_connections.fetch_add(1, Ordering::SeqCst);
+                        if active >= self.config.max_connections as u64 {
+                            self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                            warn!(
+                                active = active,
+                                max = self.config.max_connections,
+                                "Max connections reached, rejecting"
+                            );
+                            continue;
+                        }
+
+                        self.touch_activity();
+                        s.spawn(move || {
+                            if let Err(e) = self.handle_connection(stream) {
+                                debug!(error = %e, "Connection error");
+                            }
+                            self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
-
-                    self.touch_activity();
-                    if let Err(e) = self.handle_connection(stream) {
-                        debug!(error = %e, "Connection error");
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No pending connections, sleep briefly
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    self.active_connections.fetch_sub(1, Ordering::SeqCst);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No pending connections, sleep briefly
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    error!(error = %e, "Accept error");
-                    std::thread::sleep(Duration::from_millis(100));
+                    Err(e) => {
+                        error!(error = %e, "Accept error");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
-        }
+        });
 
         // Shutdown embedding worker
         if let Some(handle) = self.worker_handle.lock().take()
@@ -333,8 +371,11 @@ impl ModelDaemon {
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 100 * 1024 * 1024 {
-                warn!(len = len, "Request too large, closing connection");
+            if len > 10 * 1024 * 1024 {
+                warn!(
+                    len = len,
+                    "Request too large (max 10MB), closing connection"
+                );
                 return Ok(());
             }
 
@@ -507,7 +548,7 @@ impl ModelDaemon {
             }
 
             Request::EmbeddingJobStatus { db_path } => {
-                match crate::storage::sqlite::SqliteStorage::open(std::path::Path::new(&db_path)) {
+                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
                     Ok(storage) => match storage.get_embedding_jobs(&db_path) {
                         Ok(rows) => {
                             let jobs = rows
@@ -547,7 +588,7 @@ impl ModelDaemon {
                 }
 
                 // Also cancel in database
-                match crate::storage::sqlite::SqliteStorage::open(std::path::Path::new(&db_path)) {
+                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
                     Ok(storage) => {
                         match storage.cancel_embedding_jobs(&db_path, model_id.as_deref()) {
                             Ok(count) => Response::JobCancelled {
@@ -651,5 +692,14 @@ mod tests {
 
         // With idle_timeout = 0, should never trigger idle shutdown
         assert!(!daemon.should_shutdown_idle());
+    }
+
+    #[test]
+    fn test_daemon_run_lock_path_is_stable() {
+        let socket = PathBuf::from("/tmp/cass-semantic.sock");
+        assert_eq!(
+            daemon_run_lock_path(&socket),
+            PathBuf::from("/tmp/cass-semantic.spawnlock")
+        );
     }
 }

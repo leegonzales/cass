@@ -11,9 +11,64 @@ use frankensearch::lexical::{
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
+use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 
+fn normalized_index_source_id(
+    source_id: Option<&str>,
+    origin_kind: Option<&str>,
+    origin_host: Option<&str>,
+) -> String {
+    let trimmed_source_id = source_id.unwrap_or_default().trim();
+    if !trimmed_source_id.is_empty() {
+        if trimmed_source_id.eq_ignore_ascii_case(LOCAL_SOURCE_ID) {
+            return LOCAL_SOURCE_ID.to_string();
+        }
+        return trimmed_source_id.to_string();
+    }
+
+    let trimmed_origin_kind = origin_kind.unwrap_or_default().trim();
+    if trimmed_origin_kind.eq_ignore_ascii_case("ssh")
+        || trimmed_origin_kind.eq_ignore_ascii_case("remote")
+    {
+        return origin_host
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("remote")
+            .to_string();
+    }
+
+    LOCAL_SOURCE_ID.to_string()
+}
+
+fn normalized_index_origin_kind(source_id: &str, origin_kind: Option<&str>) -> String {
+    if let Some(kind) = origin_kind.map(str::trim).filter(|value| !value.is_empty()) {
+        if kind.eq_ignore_ascii_case("local") {
+            return LOCAL_SOURCE_ID.to_string();
+        }
+        if kind.eq_ignore_ascii_case("ssh") || kind.eq_ignore_ascii_case("remote") {
+            return "remote".to_string();
+        }
+        return kind.to_ascii_lowercase();
+    }
+
+    if source_id == LOCAL_SOURCE_ID {
+        LOCAL_SOURCE_ID.to_string()
+    } else {
+        "remote".to_string()
+    }
+}
+
+fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
+    origin_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
+const TANTIVY_ADD_BATCH_MAX_MESSAGES: usize = 512;
+const TANTIVY_ADD_BATCH_MAX_CHARS: usize = 1024 * 1024;
 
 fn map_fs_err(err: frankensearch::SearchError) -> Error {
     Error::new(err)
@@ -41,6 +96,14 @@ impl TantivyIndex {
 
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
         self.add_messages(conv, &conv.messages)
+    }
+
+    pub fn add_conversation_with_id(
+        &mut self,
+        conv: &NormalizedConversation,
+        conversation_id: Option<i64>,
+    ) -> Result<()> {
+        self.add_messages_with_conversation_id(conv, &conv.messages, conversation_id)
     }
 
     pub fn delete_all(&mut self) -> Result<()> {
@@ -80,20 +143,31 @@ impl TantivyIndex {
         conv: &NormalizedConversation,
         messages: &[NormalizedMessage],
     ) -> Result<()> {
+        self.add_messages_with_conversation_id(conv, messages, None)
+    }
+
+    pub fn add_messages_with_conversation_id(
+        &mut self,
+        conv: &NormalizedConversation,
+        messages: &[NormalizedMessage],
+        conversation_id: Option<i64>,
+    ) -> Result<()> {
         // Provenance fields (P3.x): default to local, but honor metadata injected by indexer.
         let cass_origin = conv.metadata.get("cass").and_then(|c| c.get("origin"));
-        let source_id = cass_origin
+        let raw_source_id = cass_origin
             .and_then(|o| o.get("source_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(LOCAL_SOURCE_ID);
-        let origin_kind = cass_origin
+            .and_then(|v| v.as_str());
+        let raw_origin_kind = cass_origin
             .and_then(|o| o.get("kind"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("local");
-        let origin_host = cass_origin
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned);
+            .and_then(|v| v.as_str());
+        let origin_host = normalized_index_origin_host(
+            cass_origin
+                .and_then(|o| o.get("host"))
+                .and_then(|v| v.as_str()),
+        );
+        let source_id =
+            normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
+        let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
 
         let source_path = conv.source_path.to_string_lossy().to_string();
         let workspace = conv
@@ -109,24 +183,42 @@ impl TantivyIndex {
         let title = conv.title.clone();
         let started_at_fallback = conv.started_at;
 
-        let mut docs: Vec<FsCassDocument> = Vec::with_capacity(messages.len());
+        let mut docs: Vec<FsCassDocument> = Vec::new();
+        let mut pending_chars = 0usize;
         for msg in messages {
+            if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+                continue;
+            }
             docs.push(FsCassDocument {
                 agent: conv.agent_slug.clone(),
                 workspace: workspace.clone(),
                 workspace_original: workspace_original.clone(),
                 source_path: source_path.clone(),
-                msg_idx: msg.idx as u64,
+                msg_idx: msg.idx.max(0) as u64,
                 created_at: msg.created_at.or(started_at_fallback),
                 title: title.clone(),
                 content: msg.content.clone(),
-                source_id: source_id.to_string(),
-                origin_kind: origin_kind.to_string(),
+                conversation_id,
+                source_id: source_id.clone(),
+                origin_kind: origin_kind.clone(),
                 origin_host: origin_host.clone(),
             });
+            pending_chars = pending_chars.saturating_add(msg.content.len());
+
+            if docs.len() >= TANTIVY_ADD_BATCH_MAX_MESSAGES
+                || pending_chars >= TANTIVY_ADD_BATCH_MAX_CHARS
+            {
+                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                docs.clear();
+                pending_chars = 0;
+            }
         }
 
-        self.inner.add_cass_documents(&docs).map_err(map_fs_err)
+        if docs.is_empty() {
+            Ok(())
+        } else {
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)
+        }
     }
 }
 
@@ -149,6 +241,9 @@ pub fn ensure_tokenizer(index: &mut Index) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use serde_json::Value;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -203,7 +298,7 @@ mod tests {
     fn index_dir_creates_versioned_path() {
         let dir = TempDir::new().expect("temp dir");
         let result = index_dir(dir.path()).expect("index dir");
-        assert!(result.ends_with("index/v6"));
+        assert!(result.ends_with("index/v7"));
     }
 
     #[test]
@@ -212,5 +307,44 @@ mod tests {
         let mut idx = Index::create_in_ram(build_schema());
         ensure_tokenizer(&mut idx);
         let _ = TantivyIndex::open_or_create(dir.path()).expect("open or create");
+    }
+
+    #[test]
+    fn add_messages_batches_large_payloads_without_dropping_docs() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut idx = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        let content = "x".repeat(4096);
+        let messages: Vec<_> = (0..1_200)
+            .map(|i| NormalizedMessage {
+                idx: i,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_000_000 + i),
+                content: format!("{i}-{content}"),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            })
+            .collect();
+        let conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("large-batch".to_string()),
+            title: Some("Large Batch".to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from("/tmp/rollout.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            metadata: Value::Null,
+            messages,
+        };
+
+        idx.add_messages(&conv, &conv.messages)
+            .expect("add messages");
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), conv.messages.len() as u64);
     }
 }

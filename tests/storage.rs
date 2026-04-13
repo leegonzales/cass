@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
 fn sample_agent() -> Agent {
     Agent {
@@ -46,7 +47,7 @@ fn msg(idx: i64, created_at: i64) -> Message {
 }
 
 #[test]
-fn schema_version_created_on_open() {
+fn schema_version_uses_schema_migrations_after_open() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("store.db");
     let storage = SqliteStorage::open(&db_path).expect("open");
@@ -56,11 +57,15 @@ fn schema_version_created_on_open() {
         coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
     );
 
-    // If meta row is removed, the getter surfaces an error.
-    storage.raw().execute("DELETE FROM meta", []).unwrap();
+    // `_schema_migrations` is authoritative now, so removing the legacy
+    // compatibility row must not break schema version reporting.
+    storage.raw().execute("DELETE FROM meta").unwrap();
     assert!(
-        storage.schema_version().is_err(),
-        "schema_version should return error after meta table is deleted, got: {:?}",
+        matches!(
+            storage.schema_version(),
+            Ok(coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION)
+        ),
+        "schema_version should continue reading from _schema_migrations after meta cleanup, got: {:?}",
         storage.schema_version()
     );
 }
@@ -69,7 +74,7 @@ fn schema_version_created_on_open() {
 fn rebuild_fts_repopulates_rows() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fts.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -83,64 +88,163 @@ fn rebuild_fts_repopulates_rows() {
 
     let count_messages: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
         .unwrap();
     let mut fts_count: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
         .unwrap();
     assert_eq!(fts_count, count_messages);
 
-    storage
+    storage.raw().execute("DROP TABLE fts_messages").unwrap();
+    let fts_table_count: i64 = storage
         .raw()
-        .execute("DELETE FROM fts_messages", [])
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
+            &[],
+            |r| r.get_typed(0),
+        )
         .unwrap();
-    fts_count = storage
-        .raw()
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(fts_count, 0);
+    assert_eq!(
+        fts_table_count, 0,
+        "fts_messages should be absent after drop"
+    );
 
     storage.rebuild_fts().unwrap();
     fts_count = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
         .unwrap();
     assert_eq!(fts_count, count_messages);
 }
 
 #[test]
-fn transaction_rolls_back_on_duplicate_idx() {
+fn duplicate_idx_within_new_conversation_keeps_first_message() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("rollback.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-
-    // Duplicate idx inside the same conversation should trigger UNIQUE constraint
-    // and leave the database unchanged after rollback.
     let conv = sample_conv(None, vec![msg(0, 1), msg(0, 2)]);
-    let result = storage.insert_conversation_tree(agent_id, None, &conv);
-    assert!(result.is_err());
+    let outcome = storage
+        .insert_conversation_tree(agent_id, None, &conv)
+        .expect("duplicate idx insert should keep the first canonical message");
+    assert_eq!(outcome.inserted_indices, vec![0]);
 
     let conv_count: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM conversations", [], |c| c.get(0))
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |c| {
+            c.get_typed(0)
+        })
         .unwrap();
     let msg_count: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |c| c.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |c| c.get_typed(0))
         .unwrap();
 
-    assert_eq!(conv_count, 0);
-    assert_eq!(msg_count, 0);
+    assert_eq!(conv_count, 1, "conversation should still be inserted");
+    assert_eq!(
+        msg_count, 1,
+        "only the first duplicate idx should be retained"
+    );
+}
+
+#[test]
+fn insert_conversation_tree_succeeds_without_db_resident_fts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("fts_tree_rollback.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    storage.raw().execute("DROP TABLE fts_messages").unwrap();
+
+    let conv = sample_conv(None, vec![msg(0, 1)]);
+    let result = storage.insert_conversation_tree(agent_id, None, &conv);
+    assert!(
+        result.is_ok(),
+        "missing db-resident FTS should not abort authoritative storage inserts"
+    );
+
+    let conv_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |r| {
+            r.get_typed(0)
+        })
+        .unwrap();
+    let msg_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
+        .unwrap();
+
+    let fts_table_count: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .unwrap();
+
+    assert_eq!(conv_count, 1, "conversation insert should succeed");
+    assert_eq!(msg_count, 1, "message insert should succeed");
+    assert_eq!(fts_table_count, 0, "db-resident FTS should remain absent");
+}
+
+#[test]
+fn insert_conversations_batched_succeeds_without_db_resident_fts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("fts_batch_rollback.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let convs = [
+        sample_conv(Some("batch-rollback-1"), vec![msg(0, 1)]),
+        sample_conv(Some("batch-rollback-2"), vec![msg(0, 2)]),
+    ];
+    let refs: Vec<(i64, Option<i64>, &Conversation)> =
+        convs.iter().map(|conv| (agent_id, None, conv)).collect();
+
+    storage.raw().execute("DROP TABLE fts_messages").unwrap();
+
+    let result = storage.insert_conversations_batched(&refs);
+    assert!(
+        result.is_ok(),
+        "batched insert should continue when db-resident FTS maintenance is unavailable"
+    );
+
+    let conv_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |r| {
+            r.get_typed(0)
+        })
+        .unwrap();
+    let msg_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
+        .unwrap();
+
+    let fts_table_count: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        conv_count, 2,
+        "batched conversations should still be stored"
+    );
+    assert_eq!(msg_count, 2, "batched messages should still be stored");
+    assert_eq!(fts_table_count, 0, "db-resident FTS should remain absent");
 }
 
 #[test]
 fn append_only_updates_existing_conversation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("append.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -159,22 +263,20 @@ fn append_only_updates_existing_conversation() {
 
     let rows: Vec<(i64, i64)> = storage
         .raw()
-        .prepare("SELECT idx, created_at FROM messages ORDER BY idx")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap()))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect(
+            "SELECT idx, created_at FROM messages ORDER BY idx",
+            &[],
+            |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
+        )
+        .unwrap();
     assert_eq!(rows, vec![(0, 100), (1, 200), (2, 300)]);
 
     let ended_at: i64 = storage
         .raw()
-        .query_row(
+        .query_row_map(
             "SELECT ended_at FROM conversations WHERE id = ?",
-            [outcome1.conversation_id],
-            |r| r.get(0),
+            &[ParamValue::from(outcome1.conversation_id)],
+            |r| r.get_typed(0),
         )
         .unwrap();
     assert_eq!(ended_at, 300);
@@ -184,7 +286,7 @@ fn append_only_updates_existing_conversation() {
 fn large_batch_insert_keeps_fts_in_sync() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("batch.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -202,11 +304,11 @@ fn large_batch_insert_keeps_fts_in_sync() {
 
     let msg_count: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
         .unwrap();
     let fts_count: i64 = storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
         .unwrap();
 
     assert_eq!(msg_count, 200);
@@ -215,14 +317,12 @@ fn large_batch_insert_keeps_fts_in_sync() {
     // Spot check a few message rows for correct ordering and timestamps
     let rows: Vec<(i64, i64)> = storage
         .raw()
-        .prepare("SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap()))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect(
+            "SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197",
+            &[],
+            |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
+        )
+        .unwrap();
     assert_eq!(
         rows,
         vec![(197, 1_197), (198, 1_198), (199, 1_199)],
@@ -234,7 +334,7 @@ fn large_batch_insert_keeps_fts_in_sync() {
 fn last_scan_ts_roundtrip() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("scan.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Initially None
     assert_eq!(storage.get_last_scan_ts().unwrap(), None);
@@ -252,7 +352,7 @@ fn last_scan_ts_roundtrip() {
 fn last_scan_ts_overwrite() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("scan_over.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     storage.set_last_scan_ts(10).expect("set ts 10");
     storage.set_last_scan_ts(20).expect("set ts 20");
@@ -260,7 +360,7 @@ fn last_scan_ts_overwrite() {
 }
 
 #[test]
-fn unsupported_schema_version_errors() {
+fn open_ignores_stale_meta_schema_version_once_schema_migrations_exist() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("schema.db");
 
@@ -269,17 +369,18 @@ fn unsupported_schema_version_errors() {
     // Poison the schema_version to an unsupported future value
     storage
         .raw()
-        .execute(
-            "UPDATE meta SET value = '999' WHERE key = 'schema_version'",
-            [],
-        )
+        .execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'")
         .unwrap();
     drop(storage); // Close connection before reopening
 
     let reopen = SqliteStorage::open(&db_path);
     assert!(
-        reopen.is_err(),
-        "opening with unsupported schema_version should error"
+        reopen.is_ok(),
+        "open() should rely on _schema_migrations, not the legacy meta mirror"
+    );
+    assert_eq!(
+        reopen.unwrap().schema_version().unwrap(),
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
     );
 }
 
@@ -297,12 +398,12 @@ fn fresh_db_creates_all_tables() {
     // Query sqlite_master for table names
     let tables: Vec<String> = storage
         .raw()
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .unwrap();
 
     assert!(tables.contains(&"meta".to_string()), "meta table exists");
     assert!(
@@ -350,12 +451,8 @@ fn fresh_db_creates_all_indexes() {
 
     let indexes: Vec<String> = storage
         .raw()
-        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[], |r| r.get_typed(0))
+        .unwrap();
 
     assert!(
         indexes.contains(&"idx_conversations_agent_started".to_string()),
@@ -379,12 +476,10 @@ fn agents_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .prepare("PRAGMA table_info(agents)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("PRAGMA table_info(agents)", &[], |r| {
+            r.get_typed::<String>(1)
+        })
+        .unwrap();
 
     let missing: Vec<&str> = [
         "id",
@@ -415,12 +510,10 @@ fn conversations_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .prepare("PRAGMA table_info(conversations)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("PRAGMA table_info(conversations)", &[], |r| {
+            r.get_typed::<String>(1)
+        })
+        .unwrap();
 
     let expected = [
         "id",
@@ -455,12 +548,10 @@ fn messages_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .prepare("PRAGMA table_info(messages)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("PRAGMA table_info(messages)", &[], |r| {
+            r.get_typed::<String>(1)
+        })
+        .unwrap();
 
     assert!(columns.contains(&"id".to_string()));
     assert!(columns.contains(&"conversation_id".to_string()));
@@ -481,10 +572,10 @@ fn fts_messages_is_fts5_virtual_table() {
     // Check that fts_messages is an FTS5 virtual table
     let sql: String = storage
         .raw()
-        .query_row(
+        .query_row_map(
             "SELECT sql FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            [],
-            |r| r.get(0),
+            &[],
+            |r| r.get_typed(0),
         )
         .expect("fts_messages should exist");
 
@@ -500,13 +591,60 @@ fn fts_messages_is_fts5_virtual_table() {
         "fts_messages should have workspace"
     );
     assert!(
+        sql.contains("content=''") || sql.contains("content = ''"),
+        "fts_messages should use contentless storage"
+    );
+    assert!(
+        !sql.contains("message_id UNINDEXED"),
+        "fts_messages should no longer store legacy message_id payloads"
+    );
+    assert!(
         sql.contains("porter"),
         "fts_messages should use porter tokenizer"
     );
 }
 
 #[test]
-fn migration_from_v1_applies_v2_and_v3() {
+fn fresh_database_fts_messages_is_queryable_via_frankensqlite() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("fresh-fts.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("fresh FTS table should be queryable via frankensqlite");
+    assert_eq!(count, 0, "fresh FTS table should start empty");
+}
+
+#[test]
+fn open_disables_frankensqlite_autocommit_retain() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("autocommit-retain.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let namespaced: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA fsqlite.autocommit_retain;", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("fsqlite.autocommit_retain pragma should be queryable");
+    assert_eq!(
+        namespaced, 0,
+        "storage open should disable retained autocommit"
+    );
+
+    let alias: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA autocommit_retain;", &[], |row| row.get_typed(0))
+        .expect("autocommit_retain pragma alias should be queryable");
+    assert_eq!(alias, 0, "autocommit_retain alias should also be disabled");
+}
+
+#[test]
+fn migration_from_v1_requires_rebuild() {
     use rusqlite::Connection;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -590,31 +728,29 @@ fn migration_from_v1_applies_v2_and_v3() {
         .expect("create v1 schema");
     }
 
-    // Open with SqliteStorage - should apply v2, v3, and v4 migrations
-    let storage = SqliteStorage::open(&db_path).expect("open v1 db");
-
-    // Verify migration completed
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
-        "should migrate to current schema version"
+    let result = SqliteStorage::open_or_rebuild(&db_path);
+    match result {
+        Err(MigrationError::RebuildRequired {
+            reason,
+            backup_path,
+        }) => {
+            assert!(
+                reason.contains("too old for in-place migration"),
+                "unexpected rebuild reason: {reason}"
+            );
+            assert!(backup_path.is_some(), "legacy schema should be backed up");
+        }
+        Ok(_) => panic!("expected rebuild requirement for v1 schema"),
+        Err(err) => panic!("expected rebuild requirement for v1 schema, got {err}"),
+    }
+    assert!(
+        !db_path.exists(),
+        "legacy v1 database should be removed after rebuild requirement"
     );
-
-    // Verify FTS5 table was created
-    let tables: Vec<String> = storage
-        .raw()
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_messages'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-
-    assert_eq!(tables.len(), 1, "fts_messages should exist after migration");
 }
 
 #[test]
-fn migration_from_v2_applies_v3() {
+fn migration_from_v2_requires_rebuild() {
     use rusqlite::Connection;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -710,14 +846,24 @@ fn migration_from_v2_applies_v3() {
         .expect("create v2 schema");
     }
 
-    // Open with SqliteStorage - should apply v3 and v4 migrations
-    let storage = SqliteStorage::open(&db_path).expect("open v2 db");
-
-    // Verify migration completed
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
-        "should migrate to current schema version"
+    let result = SqliteStorage::open_or_rebuild(&db_path);
+    match result {
+        Err(MigrationError::RebuildRequired {
+            reason,
+            backup_path,
+        }) => {
+            assert!(
+                reason.contains("too old for in-place migration"),
+                "unexpected rebuild reason: {reason}"
+            );
+            assert!(backup_path.is_some(), "legacy schema should be backed up");
+        }
+        Ok(_) => panic!("expected rebuild requirement for v2 schema"),
+        Err(err) => panic!("expected rebuild requirement for v2 schema, got {err}"),
+    }
+    assert!(
+        !db_path.exists(),
+        "legacy v2 database should be removed after rebuild requirement"
     );
 }
 
@@ -728,10 +874,9 @@ fn foreign_keys_are_enforced() {
     let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Try to insert a conversation with non-existent agent_id
-    let result = storage.raw().execute(
-        "INSERT INTO conversations(agent_id, source_path) VALUES(999, '/test')",
-        [],
-    );
+    let result = storage
+        .raw()
+        .execute("INSERT INTO conversations(agent_id, source_path) VALUES(999, '/test')");
 
     assert!(
         result.is_err(),
@@ -750,14 +895,12 @@ fn unique_constraints_work() {
         .raw()
         .execute(
             "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test', 'cli', 0, 0)",
-            [],
         )
         .expect("first insert");
 
     // Try to insert duplicate slug
     let result = storage.raw().execute(
         "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test2', 'cli', 0, 0)",
-        [],
     );
 
     assert!(
@@ -775,14 +918,14 @@ fn pragmas_are_applied() {
     // Check journal_mode is WAL
     let journal_mode: String = storage
         .raw()
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .query_row_map("PRAGMA journal_mode", &[], |r| r.get_typed(0))
         .unwrap();
     assert_eq!(journal_mode, "wal", "journal_mode should be WAL");
 
     // Check foreign_keys is ON
     let fk: i64 = storage
         .raw()
-        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .query_row_map("PRAGMA foreign_keys", &[], |r| r.get_typed(0))
         .unwrap();
     assert_eq!(fk, 1, "foreign_keys should be ON");
 }
@@ -962,12 +1105,10 @@ fn sources_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .prepare("PRAGMA table_info(sources)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("PRAGMA table_info(sources)", &[], |r| {
+            r.get_typed::<String>(1)
+        })
+        .unwrap();
 
     assert!(columns.contains(&"id".to_string()));
     assert!(columns.contains(&"kind".to_string()));
@@ -980,7 +1121,7 @@ fn sources_table_has_correct_columns() {
 }
 
 #[test]
-fn migration_from_v3_creates_sources_table() {
+fn migration_from_v3_requires_rebuild() {
     use rusqlite::Connection;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1075,21 +1216,24 @@ fn migration_from_v3_creates_sources_table() {
         .expect("create v3 schema");
     }
 
-    // Open with SqliteStorage - should apply v4 migration
-    let storage = SqliteStorage::open(&db_path).expect("open v3 db");
-
-    // Verify migration completed
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
-        "should migrate to current schema version"
-    );
-
-    // Verify sources table was created with local source
-    let sources = storage.list_sources().expect("list_sources");
+    let result = SqliteStorage::open_or_rebuild(&db_path);
+    match result {
+        Err(MigrationError::RebuildRequired {
+            reason,
+            backup_path,
+        }) => {
+            assert!(
+                reason.contains("too old for in-place migration"),
+                "unexpected rebuild reason: {reason}"
+            );
+            assert!(backup_path.is_some(), "legacy schema should be backed up");
+        }
+        Ok(_) => panic!("expected rebuild requirement for v3 schema"),
+        Err(err) => panic!("expected rebuild requirement for v3 schema, got {err}"),
+    }
     assert!(
-        sources.iter().any(|s| s.id == LOCAL_SOURCE_ID),
-        "local source should exist after migration"
+        !db_path.exists(),
+        "legacy v3 database should be removed after rebuild requirement"
     );
 }
 
@@ -1098,7 +1242,7 @@ fn migration_from_v3_creates_sources_table() {
 // -------------------------------------------------------------------------
 
 use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, MigrationError, cleanup_old_backups, create_backup, is_user_data_file,
+    CURRENT_SCHEMA_VERSION, cleanup_old_backups, create_backup, is_user_data_file,
 };
 
 #[test]
@@ -1131,7 +1275,7 @@ fn current_schema_version_matches_internal() {
 }
 
 #[test]
-fn create_backup_creates_timestamped_copy() {
+fn create_backup_creates_named_copy() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("backup_test.db");
 
@@ -1220,7 +1364,7 @@ fn open_or_rebuild_creates_fresh_db() {
 }
 
 #[test]
-fn open_or_rebuild_migrates_compatible_schema() {
+fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
     use rusqlite::Connection;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1319,12 +1463,24 @@ fn open_or_rebuild_migrates_compatible_schema() {
     }
 
     // Open with open_or_rebuild - should migrate successfully
-    let storage = SqliteStorage::open_or_rebuild(&db_path).expect("open_or_rebuild");
-
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        CURRENT_SCHEMA_VERSION,
-        "should migrate to current version"
+    let result = SqliteStorage::open_or_rebuild(&db_path);
+    match result {
+        Err(MigrationError::RebuildRequired {
+            reason,
+            backup_path,
+        }) => {
+            assert!(
+                reason.contains("too old for in-place migration"),
+                "unexpected rebuild reason: {reason}"
+            );
+            assert!(backup_path.is_some(), "legacy schema should be backed up");
+        }
+        Ok(_) => panic!("expected rebuild requirement for v4 schema"),
+        Err(err) => panic!("expected rebuild requirement for v4 schema, got {err}"),
+    }
+    assert!(
+        !db_path.exists(),
+        "legacy v4 database should be removed after rebuild requirement"
     );
 }
 
@@ -1431,7 +1587,7 @@ fn sample_conv_with_source(
 fn timeline_source_filter_local_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Setup: Create agent
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -1474,16 +1630,14 @@ fn timeline_source_filter_local_only() {
     // Query with source_id = 'local' filter
     let local_only: Vec<String> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'local'
              ORDER BY c.started_at DESC",
+            &[],
+            |row| row.get_typed(0),
         )
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     assert_eq!(local_only.len(), 2, "should return 2 local conversations");
     assert!(local_only.contains(&"local-1".to_string()));
@@ -1498,7 +1652,7 @@ fn timeline_source_filter_local_only() {
 fn timeline_source_filter_remote_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_remote.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1541,16 +1695,14 @@ fn timeline_source_filter_remote_only() {
     // Query with source_id != 'local' (remote filter)
     let remote_only: Vec<String> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id != 'local'
              ORDER BY c.started_at DESC",
+            &[],
+            |row| row.get_typed(0),
         )
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     assert_eq!(remote_only.len(), 2, "should return 2 remote conversations");
     assert!(remote_only.contains(&"laptop-1".to_string()));
@@ -1565,7 +1717,7 @@ fn timeline_source_filter_remote_only() {
 fn timeline_source_filter_specific_source() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_specific.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1615,16 +1767,14 @@ fn timeline_source_filter_specific_source() {
     // Query with source_id = 'laptop' (specific source)
     let laptop_only: Vec<String> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'laptop'
              ORDER BY c.started_at DESC",
+            &[],
+            |row| row.get_typed(0),
         )
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     assert_eq!(laptop_only.len(), 2, "should return 2 laptop conversations");
     assert!(laptop_only.contains(&"laptop-1".to_string()));
@@ -1649,7 +1799,7 @@ fn timeline_json_includes_source_id_field() {
     // P7.10: Verify timeline SQL returns source_id field
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_json.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1672,15 +1822,13 @@ fn timeline_json_includes_source_id_field() {
     // Query with source_id field selection (simulates timeline JSON output)
     let result: Vec<(i64, String)> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.id, c.source_id FROM conversations c
              WHERE c.source_id IS NOT NULL",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     assert!(!result.is_empty(), "should have at least one conversation");
     let (_, source_id) = &result[0];
@@ -1692,7 +1840,7 @@ fn timeline_json_includes_origin_kind_field() {
     // P7.10: Verify timeline SQL returns origin_kind from sources table
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_kind.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1731,24 +1879,22 @@ fn timeline_json_includes_origin_kind_field() {
     // Query with origin_kind from sources table (matches timeline SQL)
     let results: Vec<(String, String, String)> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id
              ORDER BY c.source_id",
+            &[],
+            |row| {
+                Ok((
+                    row.get_typed::<String>(0)?,
+                    row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    row.get_typed::<Option<String>>(2)?
+                        .unwrap_or_else(|| "local".into()),
+                ))
+            },
         )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?
-                    .unwrap_or_else(|| "local".into()),
-            ))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     assert_eq!(results.len(), 2, "should have 2 conversations");
 
@@ -1772,7 +1918,7 @@ fn timeline_json_includes_origin_host_field() {
     // P7.10: Verify timeline SQL returns origin_host for remote sessions
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_host.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1809,12 +1955,12 @@ fn timeline_json_includes_origin_host_field() {
     // Query origin_host field
     let results: Vec<(String, Option<String>)> = storage
         .raw()
-        .prepare("SELECT c.source_id, c.origin_host FROM conversations c ORDER BY c.source_id")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect(
+            "SELECT c.source_id, c.origin_host FROM conversations c ORDER BY c.source_id",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .unwrap();
 
     assert_eq!(results.len(), 2, "should have 2 conversations");
 
@@ -1850,7 +1996,7 @@ fn timeline_json_grouped_output_includes_provenance() {
     // P7.10: Verify provenance fields are present when timeline is grouped
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_grouped.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1884,23 +2030,21 @@ fn timeline_json_grouped_output_includes_provenance() {
     // Query all provenance fields as timeline JSON would
     let results: Vec<(i64, String, Option<String>, Option<String>)> = storage
         .raw()
-        .prepare(
+        .query_map_collect(
             "SELECT c.id, c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id",
+            &[],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<String>>(3)?,
+                ))
+            },
         )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .unwrap();
 
     // All entries should have source_id
     for (id, source_id, _, _) in &results {
@@ -1937,24 +2081,22 @@ fn daily_stats_table_created_on_fresh_db() {
     // Check that daily_stats table exists
     let tables: Vec<String> = storage
         .raw()
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_stats'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_stats'",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .unwrap();
 
     assert_eq!(tables.len(), 1, "daily_stats table should exist");
 
     // Check columns
     let columns: Vec<String> = storage
         .raw()
-        .prepare("PRAGMA table_info(daily_stats)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("PRAGMA table_info(daily_stats)", &[], |r| {
+            r.get_typed::<String>(1)
+        })
+        .unwrap();
 
     assert!(columns.contains(&"day_id".to_string()));
     assert!(columns.contains(&"agent_slug".to_string()));
@@ -1986,7 +2128,7 @@ fn daily_stats_day_id_conversion() {
 fn daily_stats_rebuild_from_conversations() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_rebuild.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Insert some conversations
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -2035,7 +2177,7 @@ fn daily_stats_rebuild_from_conversations() {
 fn daily_stats_count_sessions_in_range() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_count.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Insert conversations
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -2087,7 +2229,7 @@ fn daily_stats_count_sessions_in_range() {
 fn daily_stats_histogram() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_hist.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2167,7 +2309,7 @@ fn daily_stats_histogram() {
 fn daily_stats_uses_materialized_after_insert() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_materialized.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2205,7 +2347,7 @@ fn daily_stats_uses_materialized_after_insert() {
 fn daily_stats_health_no_drift_after_inserts() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_health.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2282,7 +2424,7 @@ fn daily_stats_null_timestamp_consistency() {
     // Both should map NULL -> day_id=0 (not a large negative number).
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_null_ts.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -2313,12 +2455,8 @@ fn daily_stats_null_timestamp_consistency() {
     // Check that the session was placed at day_id=0, not a negative day_id
     let day_ids: Vec<i64> = storage
         .raw()
-        .prepare("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[], |r| r.get_typed(0))
+        .unwrap();
 
     assert_eq!(day_ids.len(), 1, "should have exactly 1 day_id");
     assert_eq!(
@@ -2329,10 +2467,10 @@ fn daily_stats_null_timestamp_consistency() {
     // Verify the count at day_id=0
     let count_at_zero: i64 = storage
         .raw()
-        .query_row(
+        .query_row_map(
             "SELECT session_count FROM daily_stats WHERE day_id = 0 AND agent_slug = 'all' AND source_id = 'all'",
-            [],
-            |r| r.get(0),
+            &[],
+            |r| r.get_typed(0),
         )
         .expect("query day_id=0");
     assert_eq!(count_at_zero, 1, "day_id=0 should have 1 session");
@@ -2343,7 +2481,7 @@ fn daily_stats_null_timestamp_consistency() {
 fn daily_stats_batched_insert_no_drift() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("batched_stats.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -2405,7 +2543,7 @@ fn daily_stats_batched_insert_no_drift() {
 fn daily_stats_tree_insert_no_drift() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("tree_stats.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2460,21 +2598,17 @@ use coding_agent_search::storage::sqlite::IndexingCache;
 fn dump_agent_workspace_state(storage: &SqliteStorage) -> (Vec<(i64, String)>, Vec<(i64, String)>) {
     let agents: Vec<(i64, String)> = storage
         .raw()
-        .prepare("SELECT id, slug FROM agents ORDER BY slug")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("SELECT id, slug FROM agents ORDER BY slug", &[], |r| {
+            Ok((r.get_typed(0)?, r.get_typed(1)?))
+        })
+        .unwrap();
 
     let workspaces: Vec<(i64, String)> = storage
         .raw()
-        .prepare("SELECT id, path FROM workspaces ORDER BY path")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .query_map_collect("SELECT id, path FROM workspaces ORDER BY path", &[], |r| {
+            Ok((r.get_typed(0)?, r.get_typed(1)?))
+        })
+        .unwrap();
 
     (agents, workspaces)
 }

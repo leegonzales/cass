@@ -44,7 +44,7 @@ fn create_test_archive(temp_dir: &Path, password: &str) -> std::path::PathBuf {
     .unwrap();
 
     let encrypt_dir = temp_dir.join("encrypted");
-    let mut engine = EncryptionEngine::new(1024);
+    let mut engine = EncryptionEngine::new(1024).expect("valid chunk size");
     engine.add_password_slot(password).unwrap();
 
     engine
@@ -64,7 +64,7 @@ fn create_test_archive_with_recovery(
     fs::write(&input_path, b"Test database content").unwrap();
 
     let encrypt_dir = temp_dir.join("encrypted");
-    let mut engine = EncryptionEngine::new(1024);
+    let mut engine = EncryptionEngine::new(1024).expect("valid chunk size");
     engine.add_password_slot(password).unwrap();
     engine.add_recovery_slot(recovery).unwrap();
 
@@ -783,7 +783,7 @@ fn test_error_chain_authentication_to_recovery() {
 
 #[test]
 fn test_graceful_degradation_corrupted_archive() {
-    // Test that corruption is detected gracefully
+    // Test that corruption is rejected gracefully with a useful error.
     let temp_dir = TempDir::new().unwrap();
     let archive_dir = create_test_archive(temp_dir.path(), TEST_PASSWORD);
 
@@ -795,12 +795,11 @@ fn test_graceful_degradation_corrupted_archive() {
     let modified = config_content.replace("\"version\"", "\"garbage_field\": true, \"version\"");
     fs::write(&config_path, modified).unwrap();
 
-    // Should still load (unknown fields ignored)
-    let config = load_config(&archive_dir);
+    let err = load_config(&archive_dir).expect_err("corrupted config should be rejected");
+    let msg = err.to_string();
     assert!(
-        config.is_ok(),
-        "Should handle extra fields gracefully: {:?}",
-        config.err()
+        msg.contains("unknown field") && msg.contains("garbage_field"),
+        "Should surface the offending unexpected field cleanly: {msg}"
     );
 }
 

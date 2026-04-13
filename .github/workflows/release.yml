@@ -25,8 +25,24 @@ permissions:
   contents: read
 
 jobs:
+  validate-release-config:
+    name: Validate Release Config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - name: Check Homebrew token availability
+        run: |
+          if [[ "${HAS_HOMEBREW_TOKEN}" != "true" ]]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not configured — Homebrew tap update will be skipped after release."
+          else
+            echo "HOMEBREW_TAP_TOKEN is configured."
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate-release-config
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -51,7 +67,7 @@ jobs:
           #   artifact_name: cass
           #   asset_name: cass-darwin-amd64
           # macOS Apple Silicon
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: cass
             asset_name: cass-darwin-arm64
@@ -63,6 +79,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          # Path dependencies reference sibling directories (../repo)
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -80,6 +105,67 @@ jobs:
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify binary architecture (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          FILE_OUTPUT="$(file "$BINARY")"
+          echo "Binary file output: ${FILE_OUTPUT}"
+
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              if ! echo "$FILE_OUTPUT" | grep -q "x86-64"; then
+                echo "::error::Expected x86-64 binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            aarch64-unknown-linux-gnu)
+              if ! echo "$FILE_OUTPUT" | grep -q "aarch64\|ARM aarch64"; then
+                echo "::error::Expected aarch64 binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            x86_64-apple-darwin)
+              if ! echo "$FILE_OUTPUT" | grep -q "x86_64"; then
+                echo "::error::Expected x86_64 Mach-O binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            aarch64-apple-darwin)
+              if ! echo "$FILE_OUTPUT" | grep -q "arm64"; then
+                echo "::error::Expected arm64 Mach-O binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::warning::No architecture check defined for target ${{ matrix.target }}"
+              ;;
+          esac
+
+          echo "Architecture verification passed for ${{ matrix.target }}"
+
+      - name: Verify binary architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # Read PE header to verify machine type
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          # 0x8664 = AMD64, 0x14c = i386, 0xAA64 = ARM64
+          switch ("${{ matrix.target }}") {
+            "x86_64-pc-windows-msvc" {
+              if ($machine -ne 0x8664) {
+                Write-Error "Expected AMD64 (0x8664) but got 0x$($machine.ToString('X4'))"
+                exit 1
+              }
+            }
+          }
+          Write-Output "Architecture verification passed: machine type 0x$($machine.ToString('X4'))"
 
       - name: Create tarball with checksum (Unix)
         if: runner.os != 'Windows'
@@ -127,6 +213,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -288,16 +382,45 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check crates.io publish readiness
+        id: publish_readiness
+        shell: bash
+        run: |
+          set +e
+          cargo package --locked --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Cargo package validation passed."
+            exit 0
+          fi
+
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::Skipping crates.io publish because the manifest is not registry-ready with the currently published dependency set."
+          cat "$RUNNER_TEMP/cargo-package.log"
+
       - name: Publish to crates.io
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
         run: cargo publish --all-features --locked
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
         run: echo "::warning::CARGO_REGISTRY_TOKEN is not configured; skipping publish."
+
+      - name: Warn when manifest is not registry-ready
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready != 'true' }}
+        run: echo "::warning::Crates.io publish skipped because cargo package validation failed."
 
   # ==========================================================================
   # Notify Package Managers to Update
@@ -369,6 +492,87 @@ jobs:
           echo "     cass-linux-amd64.tar.gz: ${{ steps.checksums.outputs.linux_amd64 }}"
           echo "     cass-linux-arm64.tar.gz: ${{ steps.checksums.outputs.linux_arm64 }}"
           echo "     cass-darwin-arm64.tar.gz: ${{ steps.checksums.outputs.darwin_arm64 }}"
+
+      - name: Verify live Homebrew formula matches release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_url="https://raw.githubusercontent.com/Dicklesworthstone/homebrew-tap/main/Formula/cass.rb"
+          expected_version="${{ needs.release.outputs.version }}"
+          expected_linux_amd64="${{ steps.checksums.outputs.linux_amd64 }}"
+          expected_linux_arm64="${{ steps.checksums.outputs.linux_arm64 }}"
+          expected_darwin_arm64="${{ steps.checksums.outputs.darwin_arm64 }}"
+
+          fetch_formula() {
+            curl --fail --silent --show-error --location \
+              --retry 4 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "${formula_url}"
+          }
+
+          extract_sha() {
+            local formula="$1"
+            local asset="$2"
+            printf '%s\n' "${formula}" | sed -n "/${asset//./\\.}/{n;s/.*sha256 \"\\([0-9a-f]\\{64\\}\\)\".*/\\1/p;}"
+          }
+
+          saw_expected_version="false"
+
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if ! formula="$(fetch_formula)"; then
+              if [[ "${attempt}" -lt 12 ]]; then
+                echo "Failed to fetch Homebrew formula on attempt ${attempt}; retrying in 10s..."
+                sleep 10
+                continue
+              fi
+              echo "::warning::Unable to fetch the live Homebrew formula after repeated retries."
+              echo "::warning::Skipping checksum enforcement because GitHub raw content was unreachable."
+              exit 0
+            fi
+            actual_version="$(printf '%s\n' "${formula}" | sed -n 's/.*version \"\\([^\"]*\\)\".*/\\1/p' | head -1)"
+            actual_linux_amd64="$(extract_sha "${formula}" "cass-linux-amd64.tar.gz")"
+            actual_linux_arm64="$(extract_sha "${formula}" "cass-linux-arm64.tar.gz")"
+            actual_darwin_arm64="$(extract_sha "${formula}" "cass-darwin-arm64.tar.gz")"
+
+            if [[ "${actual_version}" == "${expected_version}" \
+              && "${actual_linux_amd64}" == "${expected_linux_amd64}" \
+              && "${actual_linux_arm64}" == "${expected_linux_arm64}" \
+              && "${actual_darwin_arm64}" == "${expected_darwin_arm64}" ]]; then
+              echo "Homebrew tap formula is up to date."
+              exit 0
+            fi
+
+            if [[ "${actual_version}" == "${expected_version}" ]]; then
+              saw_expected_version="true"
+              break
+            fi
+
+            if [[ "${attempt}" -lt 12 ]]; then
+              echo "Homebrew formula not updated yet or has mismatched checksums; retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          if [[ "${saw_expected_version}" != "true" ]]; then
+            echo "::warning::Homebrew tap formula did not update to v${expected_version} within the verification window."
+            echo "::warning::Skipping checksum enforcement because the tap update may still be queued."
+            exit 0
+          fi
+
+          echo "::error::Homebrew tap formula does not match the release after dispatch."
+          echo "::error::Expected version ${expected_version}"
+          echo "::error::Expected cass-linux-amd64.tar.gz ${expected_linux_amd64}"
+          echo "::error::Expected cass-linux-arm64.tar.gz ${expected_linux_arm64}"
+          echo "::error::Expected cass-darwin-arm64.tar.gz ${expected_darwin_arm64}"
+          echo "::error::Actual version ${actual_version}"
+          echo "::error::Actual cass-linux-amd64.tar.gz ${actual_linux_amd64}"
+          echo "::error::Actual cass-linux-arm64.tar.gz ${actual_linux_arm64}"
+          echo "::error::Actual cass-darwin-arm64.tar.gz ${actual_darwin_arm64}"
+          exit 1
 
   notify-scoop-bucket:
     name: Notify Scoop Bucket

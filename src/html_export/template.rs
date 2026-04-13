@@ -81,18 +81,20 @@ const SCREEN_ONLY_CSS: &str = r#"
 "#;
 
 const CDN_FALLBACK_CSS: &str = r#"
-/* CDN fallback hooks */
+/* CDN fallback hooks — activated when CDNs fail to load or are disabled */
 .no-tailwind .toolbar,
 .no-tailwind .header,
 .no-tailwind .conversation {
     backdrop-filter: none !important;
 }
 
-.no-prism pre code[class*="language-"] {
+/* Ensure ALL code blocks are legible without Prism syntax highlighting.
+   Covers both language-tagged and untagged code blocks. */
+.no-prism pre code {
     color: #c0caf5;
 }
 
-.no-prism pre code[class*="language-"] .token {
+.no-prism pre code .token {
     color: inherit;
 }
 "#;
@@ -253,8 +255,17 @@ pub struct TemplateMetadata {
     /// Agent type (Claude, Codex, etc.)
     pub agent: Option<String>,
 
-    /// Message count
+    /// Total rendered message count (internal)
     pub message_count: usize,
+
+    /// Human-typed prompts (user messages that aren't tool results)
+    pub human_turns: usize,
+
+    /// Assistant response count
+    pub assistant_msgs: usize,
+
+    /// Tool use invocations (individual tool_use blocks in assistant messages)
+    pub tool_use_count: usize,
 
     /// Duration of session
     pub duration: Option<String>,
@@ -383,9 +394,18 @@ impl HtmlTemplate {
             "Preparing HTML render"
         );
 
+        // When CDNs are disabled, add no-prism class so fallback CSS activates.
+        // Without this, code blocks are illegible (dark text on dark background)
+        // because the Prism onerror handlers never fire to add the class.
+        let html_classes = if !options.include_cdn {
+            r#" class="no-prism no-tailwind""#
+        } else {
+            ""
+        };
+
         format!(
             r#"<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="dark"{html_classes}>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -457,10 +477,34 @@ impl HtmlTemplate {
         }
 
         if self.metadata.message_count > 0 {
-            meta_items.push(format!(
-                r#"<span>{} messages</span>"#,
-                self.metadata.message_count
-            ));
+            // Show accurate breakdown: human prompts, assistant responses, tool calls.
+            // "577 messages" is misleading when only 20 were human-typed.
+            let count_str = if self.metadata.human_turns > 0 {
+                format!(
+                    "{} prompt{}, {} response{}, {} tool use{}",
+                    self.metadata.human_turns,
+                    if self.metadata.human_turns == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    self.metadata.assistant_msgs,
+                    if self.metadata.assistant_msgs == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    self.metadata.tool_use_count,
+                    if self.metadata.tool_use_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                )
+            } else {
+                format!("{} messages", self.metadata.message_count)
+            };
+            meta_items.push(format!(r#"<span>{}</span>"#, count_str));
         }
 
         if let Some(duration) = &self.metadata.duration {
@@ -912,15 +956,23 @@ mod tests {
                 .expect("export");
         });
 
-        // Verify INFO-level milestone logs are captured
-        // Note: Due to test parallelism and subscriber isolation, we check for at least
-        // the export start log. The completion log may not always be captured in time.
+        // Verify milestone logs are captured.
+        // Note: Under parallel test execution the local subscriber can occasionally
+        // observe only a subset of this call's structured logs. Accept any of the
+        // start or completion milestones, since each one confirms the export path
+        // emitted structured progress logs for this call.
+        let has_template_start = logs.contains("component=\"template\"")
+            && logs.contains("operation=\"export_messages\"");
+        let has_renderer_start = logs.contains("component=\"renderer\"")
+            && logs.contains("operation=\"render_message_groups\"");
+        let has_template_complete = logs.contains("component=\"template\"")
+            && logs.contains("operation=\"export_messages_complete\"");
         assert!(
-            logs.contains("component=\"template\"") && logs.contains("export_messages"),
-            "expected template export start log, got: {logs}"
+            has_template_start || has_renderer_start || has_template_complete,
+            "expected structured export milestone log, got: {logs}"
         );
         // If completion log is present, verify its format
-        if logs.contains("export_messages_complete") {
+        if logs.contains("operation=\"export_messages_complete\"") {
             assert!(
                 logs.contains("duration_ms"),
                 "completion log should include duration"

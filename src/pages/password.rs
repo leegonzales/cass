@@ -110,14 +110,14 @@ pub struct PasswordChecks {
 /// # Example
 ///
 /// ```
-/// use cass::pages::password::validate_password;
+/// use coding_agent_search::pages::password::{PasswordStrength, validate_password};
 ///
 /// let result = validate_password("MySecureP@ssw0rd!");
 /// assert_eq!(result.strength, PasswordStrength::Strong);
 /// assert!(result.suggestions.is_empty());
 /// ```
 pub fn validate_password(password: &str) -> PasswordValidation {
-    let length = password.len();
+    let length = password.chars().count();
     let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
     let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
     let has_digit = password.chars().any(|c| c.is_ascii_digit());
@@ -213,7 +213,7 @@ fn estimate_entropy(password: &str) -> f64 {
     }
 
     let bits_per_char = (pool_size as f64).log2();
-    let length = password.len() as f64;
+    let length = password.chars().count() as f64;
 
     bits_per_char * length
 }

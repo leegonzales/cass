@@ -47,6 +47,7 @@
 //! ```
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -109,9 +110,9 @@ impl TwoTierConfig {
         }
 
         if let Ok(val) = dotenvy::var("CASS_TWO_TIER_QUALITY_WEIGHT")
-            && let Ok(weight) = val.parse()
+            && let Ok(weight) = val.parse::<f32>()
         {
-            cfg.quality_weight = weight;
+            cfg.quality_weight = weight.clamp(0.0, 1.0);
         }
 
         if let Ok(val) = dotenvy::var("CASS_TWO_TIER_MAX_REFINEMENT")
@@ -144,7 +145,7 @@ impl TwoTierConfig {
         FsTwoTierConfig {
             quality_weight: f64::from(self.quality_weight),
             fast_only: self.fast_only,
-            ..FsTwoTierConfig::default()
+            ..FsTwoTierConfig::optimized().with_env_overrides()
         }
     }
 }
@@ -306,11 +307,18 @@ impl TwoTierIndex {
         builder.set_fast_embedder_id(&fast_embedder_id);
         builder.set_quality_embedder_id(&quality_embedder_id);
 
-        let mut doc_ids = Vec::with_capacity(doc_count);
-        let mut message_ids = Vec::with_capacity(doc_count);
+        let mut metadata_by_encoded_id = HashMap::with_capacity(doc_count);
 
         for entry in entries {
             let doc_id_str = entry.doc_id.encode();
+            if metadata_by_encoded_id
+                .insert(doc_id_str.clone(), (entry.doc_id.clone(), entry.message_id))
+                .is_some()
+            {
+                bail!(
+                    "duplicate document id encountered while building two-tier index: {doc_id_str}"
+                );
+            }
             let fast_f32: Vec<f32> = entry.fast_embedding.iter().map(|v| f32::from(*v)).collect();
             let quality_f32: Vec<f32> = entry
                 .quality_embedding
@@ -321,13 +329,29 @@ impl TwoTierIndex {
             builder
                 .add_record(&doc_id_str, &fast_f32, Some(&quality_f32))
                 .map_err(|e| anyhow::anyhow!("failed to add record {doc_id_str}: {e}"))?;
-            doc_ids.push(entry.doc_id);
-            message_ids.push(entry.message_id);
         }
 
         let fs_index = builder
             .finish()
             .map_err(|e| anyhow::anyhow!("failed to finish fs index: {e}"))?;
+
+        // frankensearch persists records sorted by doc_id hash/doc_id, so hit indices
+        // are in fast-index order rather than cass insertion order. Rebuild our side
+        // tables to match that canonical order before any search results are exposed.
+        let mut doc_ids = Vec::with_capacity(doc_count);
+        let mut message_ids = Vec::with_capacity(doc_count);
+        for idx in 0..doc_count {
+            let encoded = fs_index
+                .doc_id_at(idx)
+                .map_err(|e| anyhow::anyhow!("failed to read fs doc_id at index {idx}: {e}"))?;
+            let (doc_id, message_id) = metadata_by_encoded_id.remove(encoded).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frankensearch index returned unknown doc_id at index {idx}: {encoded}"
+                )
+            })?;
+            doc_ids.push(doc_id);
+            message_ids.push(message_id);
+        }
 
         Ok(Self {
             metadata: TwoTierMetadata {
@@ -413,14 +437,19 @@ impl TwoTierIndex {
 
         match fs_index.quality_scores_for_hits(query_vec, &all_hits) {
             Ok(scores) => {
-                // Build scored results and sort by score descending
+                // Build scored results and sort by score descending.
+                // Documents without quality-tier vectors (None) are skipped.
                 let mut results: Vec<ScoredResult> = scores
                     .iter()
                     .enumerate()
-                    .map(|(idx, &score)| ScoredResult {
-                        idx,
-                        message_id: self.message_ids[idx],
-                        score,
+                    .filter_map(|(idx, score)| {
+                        let s = (*score)?;
+                        let message_id = *self.message_ids.get(idx)?;
+                        Some(ScoredResult {
+                            idx,
+                            message_id,
+                            score: s,
+                        })
                     })
                     .collect();
                 results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -456,7 +485,7 @@ impl TwoTierIndex {
             .collect();
 
         match fs_index.quality_scores_for_hits(query_vec, &hits) {
-            Ok(scores) => scores,
+            Ok(scores) => scores.into_iter().map(|s| s.unwrap_or(0.0)).collect(),
             Err(e) => {
                 warn!(error = %e, "frankensearch quality scoring failed; using zero scores");
                 vec![0.0; indices.len()]
@@ -497,12 +526,12 @@ pub struct ScoredResult {
 /// Search phase result for progressive display.
 #[derive(Debug, Clone)]
 pub enum SearchPhase {
-    /// Initial fast results.
+    /// Initial results from fast embeddings.
     Initial {
         results: Vec<ScoredResult>,
         latency_ms: u64,
     },
-    /// Refined quality results.
+    /// Refined results from quality embeddings (if daemon available).
     Refined {
         results: Vec<ScoredResult>,
         latency_ms: u64,
@@ -706,12 +735,16 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
                                 let mut blended: Vec<ScoredResult> =
                                     Vec::with_capacity(fast_results.len());
                                 for (idx, fast) in fast_results.iter().enumerate() {
+                                    let fast_s = fast_norm.get(idx).copied().unwrap_or(0.0);
                                     let score = if idx < quality_norm.len() {
-                                        let fast_s = fast_norm.get(idx).copied().unwrap_or(0.0);
-                                        let quality_s = quality_norm[idx];
+                                        let quality_s =
+                                            quality_norm.get(idx).copied().unwrap_or(0.0);
                                         (1.0 - weight) * fast_s + weight * quality_s
                                     } else {
-                                        fast_norm.get(idx).copied().unwrap_or(fast.score)
+                                        // Unrefined documents get a penalized score that assumes 0.0 for quality
+                                        // to preserve their original ranking but place them appropriately below
+                                        // high-quality refined items.
+                                        fast_s * (1.0 - weight)
                                     };
                                     blended.push(ScoredResult {
                                         idx: fast.idx,
@@ -768,15 +801,38 @@ pub fn normalize_scores(scores: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
-    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &s in scores {
+        if s.is_finite() {
+            min = f32::min(min, s);
+            max = f32::max(max, s);
+        }
+    }
+
+    if min.is_infinite() || max.is_infinite() {
+        return vec![0.0; scores.len()];
+    }
+
     let range = max - min;
 
     if range.abs() < f32::EPSILON {
-        return vec![1.0; scores.len()];
+        return scores
+            .iter()
+            .map(|&s| if s.is_finite() { 1.0 } else { 0.0 })
+            .collect();
     }
 
-    scores.iter().map(|&s| (s - min) / range).collect()
+    scores
+        .iter()
+        .map(|&s| {
+            if s.is_finite() {
+                (s - min) / range
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 /// Blend two score vectors with the given weight for the second vector.
@@ -982,6 +1038,45 @@ mod tests {
     }
 
     #[test]
+    fn test_side_tables_follow_frankensearch_index_order() {
+        let config = TwoTierConfig::default();
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: DocumentId::Session("session-z".into()),
+                message_id: 300,
+                fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
+                quality_embedding: vec![f16::from_f32(1.0); config.quality_dimension],
+            },
+            TwoTierEntry {
+                doc_id: DocumentId::Session("session-a".into()),
+                message_id: 100,
+                fast_embedding: vec![f16::from_f32(0.5); config.fast_dimension],
+                quality_embedding: vec![f16::from_f32(0.5); config.quality_dimension],
+            },
+            TwoTierEntry {
+                doc_id: DocumentId::Session("session-m".into()),
+                message_id: 200,
+                fast_embedding: vec![f16::from_f32(0.25); config.fast_dimension],
+                quality_embedding: vec![f16::from_f32(0.25); config.quality_dimension],
+            },
+        ];
+        let expected_by_encoded = HashMap::from([
+            ("s:session-z".to_string(), 300_u64),
+            ("s:session-a".to_string(), 100_u64),
+            ("s:session-m".to_string(), 200_u64),
+        ]);
+
+        let index = TwoTierIndex::build("fast-256", "quality-384", &config, entries).unwrap();
+        let fs_index = index.fs_index.as_ref().expect("non-empty fs index");
+
+        for idx in 0..index.len() {
+            let encoded = fs_index.doc_id_at(idx).expect("fs doc_id");
+            assert_eq!(index.doc_ids[idx].encode(), encoded);
+            assert_eq!(index.message_ids[idx], expected_by_encoded[encoded]);
+        }
+    }
+
+    #[test]
     fn test_quality_search() {
         let config = TwoTierConfig::default();
         let entries = make_test_entries(100, config.fast_dimension, config.quality_dimension);
@@ -1016,6 +1111,29 @@ mod tests {
         for n in &normalized {
             assert!((n - 1.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn test_score_normalization_constant_with_nan_keeps_nan_zeroed() {
+        let scores = vec![f32::NAN, 0.5, 0.5];
+        let normalized = normalize_scores(&scores);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0], 0.0);
+        assert!((normalized[1] - 1.0).abs() < 0.001);
+        assert!((normalized[2] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_score_normalization_with_infinite_values_keeps_non_finite_zeroed() {
+        let scores = vec![f32::NEG_INFINITY, 2.0, f32::INFINITY, 4.0];
+        let normalized = normalize_scores(&scores);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[0], 0.0);
+        assert_eq!(normalized[2], 0.0);
+        assert!((normalized[1] - 0.0).abs() < 0.001);
+        assert!((normalized[3] - 1.0).abs() < 0.001);
     }
 
     #[test]

@@ -8,11 +8,12 @@
 //!
 //! Bead: coding_agent_session_search-1p9xd
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[macro_use]
 mod util;
@@ -53,7 +54,7 @@ fn count_messages(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
         .expect("count messages")
 }
 
@@ -62,7 +63,9 @@ fn count_conversations(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |r| {
+            r.get_typed(0)
+        })
         .expect("count conversations")
 }
 
@@ -71,7 +74,7 @@ fn count_agents(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM agents", &[], |r| r.get_typed(0))
         .expect("count agents")
 }
 
@@ -86,6 +89,12 @@ fn parse_search_hits(output: &[u8]) -> Vec<Value> {
         .and_then(|h| h.as_array())
         .cloned()
         .unwrap_or_default()
+}
+
+fn cass_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_cass")
+        .ok()
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
 
 // ============================================================================
@@ -131,7 +140,7 @@ fn e2e_multi_agent_index_and_search() {
     );
 
     // ---- Phase 2: Full index ----
-    let index_result = cargo_bin_cmd!("cass")
+    let index_result = Command::new(cass_bin())
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -178,7 +187,7 @@ fn e2e_multi_agent_index_and_search() {
     );
 
     // ---- Phase 4: Lexical search for Codex content ----
-    let codex_search = cargo_bin_cmd!("cass")
+    let codex_search = Command::new(cass_bin())
         .args([
             "search",
             "authentication_flow_alpha",
@@ -217,7 +226,7 @@ fn e2e_multi_agent_index_and_search() {
     );
 
     // ---- Phase 5: Lexical search for Claude content ----
-    let claude_search = cargo_bin_cmd!("cass")
+    let claude_search = Command::new(cass_bin())
         .args(["search", "database_query_beta", "--robot", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -240,7 +249,7 @@ fn e2e_multi_agent_index_and_search() {
     );
 
     // ---- Phase 6: Search for non-existent term ----
-    let empty_search = cargo_bin_cmd!("cass")
+    let empty_search = Command::new(cass_bin())
         .args([
             "search",
             "zzz_nonexistent_term_zzz",
@@ -301,7 +310,7 @@ fn e2e_robot_mode_json_structure() {
         1733097600000,
     );
 
-    cargo_bin_cmd!("cass")
+    let index_output = Command::new(cass_bin())
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -309,10 +318,16 @@ fn e2e_robot_mode_json_structure() {
         .env("HOME", home)
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_CONFIG_HOME", &xdg_config)
-        .assert()
-        .success();
+        .output()
+        .expect("index command should execute");
 
-    let output = cargo_bin_cmd!("cass")
+    assert!(
+        index_output.status.success(),
+        "Index should succeed. stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+
+    let output = Command::new(cass_bin())
         .args([
             "search",
             "unique_json_structure_token",
@@ -382,7 +397,7 @@ fn e2e_database_integrity() {
         1731744000000,
     );
 
-    cargo_bin_cmd!("cass")
+    let index_output = Command::new(cass_bin())
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -390,8 +405,14 @@ fn e2e_database_integrity() {
         .env("HOME", home)
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_CONFIG_HOME", &xdg_config)
-        .assert()
-        .success();
+        .output()
+        .expect("index command should execute");
+
+    assert!(
+        index_output.status.success(),
+        "Index should succeed. stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
 
     let db_path = data_dir.join("agent_search.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
@@ -399,31 +420,31 @@ fn e2e_database_integrity() {
 
     // Every message should reference a valid conversation
     let orphan_msgs: i64 = conn
-        .query_row(
+        .query_row_map(
             "SELECT COUNT(*) FROM messages m
              LEFT JOIN conversations c ON m.conversation_id = c.id
              WHERE c.id IS NULL",
-            [],
-            |r| r.get(0),
+            &[],
+            |r| r.get_typed(0),
         )
         .expect("orphan check");
     assert_eq!(orphan_msgs, 0, "No orphan messages should exist");
 
     // Every conversation should reference a valid agent
     let orphan_convs: i64 = conn
-        .query_row(
+        .query_row_map(
             "SELECT COUNT(*) FROM conversations c
              LEFT JOIN agents a ON c.agent_id = a.id
              WHERE a.id IS NULL",
-            [],
-            |r| r.get(0),
+            &[],
+            |r| r.get_typed(0),
         )
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
     // FTS table should have entries for indexed messages
     let fts_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
         .expect("fts count");
     let msg_count = count_messages(&db_path);
     assert!(fts_count > 0, "FTS should have entries after indexing");
@@ -462,7 +483,7 @@ fn e2e_stats_after_index() {
         1732118400000,
     );
 
-    cargo_bin_cmd!("cass")
+    let index_output = Command::new(cass_bin())
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -470,11 +491,17 @@ fn e2e_stats_after_index() {
         .env("HOME", home)
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_CONFIG_HOME", &xdg_config)
-        .assert()
-        .success();
+        .output()
+        .expect("index command should execute");
+
+    assert!(
+        index_output.status.success(),
+        "Index should succeed. stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
 
     // Run stats command (exercises the frankensqlite-migrated run_stats path)
-    let stats_output = cargo_bin_cmd!("cass")
+    let stats_output = Command::new(cass_bin())
         .args(["stats", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -524,7 +551,7 @@ fn e2e_diag_after_index() {
         1732118400000,
     );
 
-    cargo_bin_cmd!("cass")
+    let index_output = Command::new(cass_bin())
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -532,11 +559,17 @@ fn e2e_diag_after_index() {
         .env("HOME", home)
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_CONFIG_HOME", &xdg_config)
-        .assert()
-        .success();
+        .output()
+        .expect("index command should execute");
+
+    assert!(
+        index_output.status.success(),
+        "Index should succeed. stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
 
     // Run diag command
-    let diag_output = cargo_bin_cmd!("cass")
+    let diag_output = Command::new(cass_bin())
         .args(["diag", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)

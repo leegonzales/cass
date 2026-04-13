@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
+use frankensqlite::params;
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -62,6 +63,7 @@ pub enum SecretLocation {
     ConversationMetadata,
     MessageContent,
     MessageMetadata,
+    MessageSnippet,
 }
 
 impl SecretLocation {
@@ -71,6 +73,7 @@ impl SecretLocation {
             SecretLocation::ConversationMetadata => "conversation.metadata",
             SecretLocation::MessageContent => "message.content",
             SecretLocation::MessageMetadata => "message.metadata",
+            SecretLocation::MessageSnippet => "message.snippet",
         }
     }
 }
@@ -188,6 +191,9 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "openai_key",
             severity: SecretSeverity::High,
+            // Note: this also matches Anthropic keys (sk-ant-...) — the anthropic_key
+            // pattern below is more specific and checked separately. Dedup by position
+            // in the caller prevents double-reporting.
             regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
         },
         SecretPattern {
@@ -204,8 +210,10 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "private_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            regex: Regex::new(
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+            )
+            .expect("private key regex"),
         },
         SecretPattern {
             id: "database_url",
@@ -257,19 +265,19 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    let conn = open_with_flags(
-        &db_path.as_ref().to_string_lossy(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .context("Failed to open database for secret scan")?;
+    let conn = super::open_existing_sqlite_db(db_path.as_ref())
+        .context("Failed to open database for secret scan")?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut truncated = false;
 
+    // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
+    // conversations with NULL agent_id — dropping them would hide credential
+    // leaks rather than exposing them.
     let (conv_where, conv_params) = build_where_clause(filters)?;
     let conv_sql = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, a.slug, w.path\n         FROM conversations c\n         JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
         conv_where
     );
     let conv_param_values = params_from_iter(conv_params);
@@ -333,7 +341,7 @@ pub fn scan_database<P: AsRef<Path>>(
     if !truncated {
         let (msg_where, msg_params) = build_where_clause(filters)?;
         let msg_sql = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, a.slug, w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             msg_where
         );
         let msg_param_values = params_from_iter(msg_params);
@@ -395,6 +403,59 @@ pub fn scan_database<P: AsRef<Path>>(
         }
     }
 
+    if !truncated && table_exists(&conn, "snippets") {
+        let (snip_where, snip_params) = build_where_clause(filters)?;
+        let snip_sql = format!(
+            "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            snip_where
+        );
+        let snip_param_values = params_from_iter(snip_params);
+        let snip_rows = conn.query_with_params(&snip_sql, &snip_param_values)?;
+
+        for row in &snip_rows {
+            if running
+                .as_ref()
+                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+            {
+                break;
+            }
+            let snippet_text: String = row.get_typed(0)?;
+            let msg_id: i64 = row.get_typed(1)?;
+            let msg_idx: i64 = row.get_typed(2)?;
+            let conv_id: i64 = row.get_typed(3)?;
+            let source_path: String = row.get_typed(4)?;
+            let agent_slug: String = row.get_typed(5)?;
+            let workspace_path: Option<String> = row.get_typed(6)?;
+
+            let ctx = ScanContext {
+                agent: Some(agent_slug),
+                workspace: workspace_path,
+                source_path: Some(source_path),
+                conversation_id: Some(conv_id),
+                message_id: Some(msg_id),
+                message_idx: Some(msg_idx),
+            };
+
+            scan_text(
+                &snippet_text,
+                SecretLocation::MessageSnippet,
+                &ctx,
+                config,
+                &mut findings,
+                &mut seen,
+                &mut truncated,
+            );
+
+            if truncated {
+                break;
+            }
+
+            if let Some(pb) = progress {
+                pb.inc(1);
+            }
+        }
+    }
+
     findings.sort_by(|a, b| {
         a.severity
             .rank()
@@ -422,6 +483,20 @@ pub fn scan_database<P: AsRef<Path>>(
         },
         findings,
     })
+}
+
+fn table_exists(conn: &frankensqlite::Connection, table_name: &str) -> bool {
+    if !table_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return false;
+    }
+
+    let pragma = format!("PRAGMA table_info({table_name})");
+    conn.query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
+        .map(|columns| !columns.is_empty())
+        .unwrap_or(false)
 }
 
 pub fn print_human_report(
@@ -848,19 +923,27 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
 
-    if let Some(agents) = filters.agents.as_ref().filter(|a| !a.is_empty()) {
-        let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
-        conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
-        for agent in agents {
-            params.push(ParamValue::from(agent.as_str()));
+    if let Some(agents) = filters.agents.as_ref() {
+        if agents.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
+            conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
+            for agent in agents {
+                params.push(ParamValue::from(agent.as_str()));
+            }
         }
     }
 
-    if let Some(workspaces) = filters.workspaces.as_ref().filter(|w| !w.is_empty()) {
-        let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
-        conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
-        for ws in workspaces {
-            params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+    if let Some(workspaces) = filters.workspaces.as_ref() {
+        if workspaces.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
+            conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
+            for ws in workspaces {
+                params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+            }
         }
     }
 
@@ -1281,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn build_where_clause_empty_agent_list_ignored() {
+    fn build_where_clause_empty_agent_list_matches_nothing() {
         let filters = SecretScanFilters {
             agents: Some(vec![]),
             workspaces: None,
@@ -1289,7 +1372,27 @@ mod tests {
             until_ts: None,
         };
         let (clause, _) = build_where_clause(&filters).unwrap();
-        assert!(clause.is_empty(), "empty agent list should be ignored");
+        assert!(
+            clause.contains("1=0"),
+            "empty agent list should match nothing: {}",
+            clause
+        );
+    }
+
+    #[test]
+    fn build_where_clause_empty_workspace_list_matches_nothing() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: Some(vec![]),
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, _) = build_where_clause(&filters).unwrap();
+        assert!(
+            clause.contains("1=0"),
+            "empty workspace list should match nothing: {}",
+            clause
+        );
     }
 
     // =========================================================================

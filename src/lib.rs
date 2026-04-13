@@ -22,10 +22,10 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use indexer::IndexOptions;
-use semver::Version;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,41 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
+}
+
+fn with_frankensqlite_connection<T, F>(
+    db_path: &Path,
+    context: &str,
+    op: F,
+) -> std::result::Result<T, frankensqlite::FrankenError>
+where
+    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+{
+    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let result = op(&conn);
+    let close_result = conn.close_in_place();
+    match (result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Ok(value)
+        }
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed after error; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Err(err)
+        }
+    }
 }
 
 /// Command-line interface.
@@ -92,6 +127,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub nowrap: bool,
 
+    /// Output format for robot mode (overrides --json when specified)
+    #[arg(long, value_enum, global = true)]
+    pub robot_format: Option<RobotFormat>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -109,7 +148,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         reset_state: bool,
 
-        /// Record terminal output to asciicast v2 file (for demos/bug repro)
+        /// Record terminal output to an asciicast v2 file; in non-interactive
+        /// headless --once mode cass writes a labeled sentinel cast because no
+        /// live TUI session is launched.
         #[arg(long, value_hint = ValueHint::FilePath)]
         asciicast: Option<PathBuf>,
 
@@ -154,6 +195,12 @@ pub enum Commands {
         /// Trigger a single watch cycle for specific paths (comma-separated or repeated)
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         watch_once: Option<Vec<PathBuf>>,
+
+        /// Minimum seconds between watch scan cycles (default: 30).
+        /// Prevents high CPU usage from tight-loop scanning when filesystem
+        /// events arrive continuously.
+        #[arg(long, default_value_t = 30)]
+        watch_interval: u64,
 
         /// Build semantic vector index after text indexing
         #[arg(long)]
@@ -213,10 +260,6 @@ pub enum Commands {
         /// Output as JSON (--robot also works). Equivalent to --robot-format json
         #[arg(long, visible_alias = "robot")]
         json: bool,
-        /// Robot output format: json (pretty), jsonl (streaming), compact (single-line), sessions (paths), toon (token-optimized).
-        /// Env: CASS_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
-        #[arg(long, value_enum)]
-        robot_format: Option<RobotFormat>,
         /// Include extended metadata in robot output (`elapsed_ms`, `wildcard_fallback`, `cache_stats`)
         #[arg(long)]
         robot_meta: bool,
@@ -347,9 +390,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
+
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
         #[arg(long)]
         source: Option<String>,
@@ -362,9 +407,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
+
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Include verbose information (file sizes, timestamps)
         #[arg(long, short)]
         verbose: bool,
@@ -374,9 +421,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON (default for robot consumption)
+
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Include _meta block (elapsed, freshness, data_dir/db_path)
         #[arg(long, default_value_t = false)]
         robot_meta: bool,
@@ -386,7 +435,7 @@ pub enum Commands {
     },
     /// Discover available features, versions, and limits for agent introspection
     Capabilities {
-        /// Output as JSON (default for robot consumption)
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -395,9 +444,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON (default for robot consumption)
+
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Include _meta block (elapsed, freshness, data_dir/db_path)
         #[arg(long, default_value_t = false)]
         robot_meta: bool,
@@ -407,13 +458,13 @@ pub enum Commands {
     },
     /// Show API + contract version info
     ApiVersion {
-        /// Output as JSON (default for robot consumption)
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
     /// Full API schema introspection - commands, arguments, and response schemas
     Introspect {
-        /// Output as JSON (default for robot consumption)
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -421,13 +472,16 @@ pub enum Commands {
     View {
         /// Path to the source file
         path: PathBuf,
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Line number to show (1-indexed)
         #[arg(long, short = 'n')]
         line: Option<usize>,
         /// Number of context lines before/after
         #[arg(long, short = 'C', default_value_t = 5)]
         context: usize,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -443,7 +497,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         robot_meta: bool,
         /// Staleness threshold in seconds (default: 300)
-        #[arg(long, default_value = "300")]
+        #[arg(long, default_value_t = 300)]
         stale_threshold: u64,
     },
     /// Diagnose and repair cass installation issues. Safe by default - never deletes user data.
@@ -452,9 +506,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
+
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Apply safe fixes automatically (rebuilds index/db from source data)
         #[arg(long)]
         fix: bool,
@@ -469,20 +525,86 @@ pub enum Commands {
     Context {
         /// Path to the source session file
         path: PathBuf,
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
+
         /// Maximum results per relation type (default: 5)
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// List recent sessions, with optional workspace/current-session filtering
+    Sessions {
+        /// Filter to sessions for this workspace/project directory
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        workspace: Option<PathBuf>,
+        /// Resolve the current workspace automatically and return the most recent match
+        #[arg(long, default_value_t = false)]
+        current: bool,
+        /// Maximum sessions to return (defaults: 10, or 1 with --current)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output as JSON (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Resolve a session path into a ready-to-run resume command for
+    /// its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini).
+    ///
+    /// By default, the resolved command is printed to stdout, one
+    /// argv token per line, so the caller can wrap it however they like:
+    ///
+    ///   eval "$(cass resume /path/to/session.jsonl --shell)"
+    ///   $(cass resume /path/to/session.jsonl --shell) # direct exec
+    ///
+    /// Use `--exec` to have cass `exec` the command directly, replacing
+    /// the current process.
+    Resume {
+        /// Session file path (as printed by `cass search` or `cass sessions`)
+        #[arg(value_hint = ValueHint::FilePath)]
+        path: PathBuf,
+        /// Override the detected harness (see `--help` for accepted values).
+        #[arg(
+            long,
+            long_help = "Override the detected harness. Accepted values:\n\
+                \x20 claude | claude-code | claude_code\n\
+                \x20 codex\n\
+                \x20 opencode\n\
+                \x20 pi_agent | pi-agent     (let path inference pick `pi` vs `omp`)\n\
+                \x20 pi                      (force the pi-mono binary)\n\
+                \x20 omp | oh-my-pi | ohmypi (force the Oh My Pi binary)\n\
+                \x20 gemini"
+        )]
+        agent: Option<String>,
+        /// Replace the current process with the resolved resume command.
+        /// Mutually exclusive with `--shell` and `--json`.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["shell", "json"])]
+        exec: bool,
+        /// Emit a single shell-escaped command line on stdout (suitable
+        /// for `eval "$(cass resume ...)"`). Mutually exclusive with
+        /// `--json`.
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        shell: bool,
+        /// Output as JSON (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
     /// Export a conversation to markdown or other formats
     Export {
         /// Path to session file
         path: PathBuf,
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Output format
         #[arg(long, value_enum, default_value_t = ConvExportFormat::Markdown)]
         format: ConvExportFormat,
@@ -492,12 +614,19 @@ pub enum Commands {
         /// Include tool use details in export
         #[arg(long)]
         include_tools: bool,
+        /// Include skill content in export (default: stripped for privacy)
+        #[arg(long)]
+        include_skills: bool,
     },
     /// Export session as beautiful, self-contained HTML (with optional encryption)
     #[command(name = "export-html")]
     ExportHtml {
         /// Path to session file
         session: PathBuf,
+
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
 
         /// Output directory (default: current directory)
         #[arg(long)]
@@ -531,6 +660,12 @@ pub enum Commands {
         #[arg(long)]
         no_cdns: bool,
 
+        /// Include skill content in export (default: stripped for privacy).
+        /// Skills injected by Claude Code/Codex contain proprietary SKILL.md
+        /// content that should not appear in shared/published exports.
+        #[arg(long)]
+        include_skills: bool,
+
         /// Default theme (dark or light)
         #[arg(long, default_value = "dark")]
         theme: String,
@@ -555,13 +690,16 @@ pub enum Commands {
     Expand {
         /// Path to session file
         path: PathBuf,
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Line number to show context around
         #[arg(long, short = 'n')]
         line: usize,
         /// Number of messages before/after (default: 3)
         #[arg(long, short = 'C', default_value_t = 3)]
         context: usize,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -582,9 +720,11 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
+
+        /// Output as JSON (--robot also works). Equivalent to --robot-format json
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
         /// Group by: hour, day, or none
         #[arg(long, value_enum, default_value_t = TimelineGrouping::Hour)]
         group_by: TimelineGrouping,
@@ -678,8 +818,9 @@ pub enum Commands {
         #[arg(long)]
         i_understand_unencrypted_risks: bool,
 
-        /// Include message attachments (images, PDFs, code snapshots)
-        #[arg(long)]
+        /// Include message attachments (images, PDFs, code snapshots).
+        /// Not yet implemented; config validation rejects this flag.
+        #[arg(long, hide = true)]
         include_attachments: bool,
 
         /// Preview an existing export locally (starts HTTP server)
@@ -729,6 +870,23 @@ pub enum Commands {
     /// ```
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
+
+    /// Run the semantic model daemon (Unix only)
+    #[cfg(unix)]
+    Daemon {
+        /// Socket path to listen on (default comes from env or built-in config)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Idle timeout in seconds before auto-shutdown (0 = never; default comes from env or built-in config)
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+        /// Maximum concurrent connections (default comes from env or built-in config)
+        #[arg(long)]
+        max_connections: Option<usize>,
+        /// Override data dir for model storage
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -747,10 +905,6 @@ pub enum ImportCommand {
         /// Output directory (default: ChatGPT app support dir on macOS, or ~/.local/share/cass/chatgpt/ on Linux)
         #[arg(long)]
         output_dir: Option<PathBuf>,
-
-        /// Output as JSON
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
     },
 }
 
@@ -762,7 +916,7 @@ pub enum SourcesCommand {
         /// Show detailed information
         #[arg(long, short)]
         verbose: bool,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -799,7 +953,7 @@ pub enum SourcesCommand {
         /// Check only specific source (defaults to all)
         #[arg(long, short)]
         source: Option<String>,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -817,7 +971,7 @@ pub enum SourcesCommand {
         /// Dry run - show what would be synced without actually syncing
         #[arg(long)]
         dry_run: bool,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -832,7 +986,7 @@ pub enum SourcesCommand {
         /// Skip hosts that are already configured as sources
         #[arg(long)]
         skip_existing: bool,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -928,7 +1082,7 @@ pub enum SourcesCommand {
 pub enum ModelsCommand {
     /// Show model installation status
     Status {
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -937,11 +1091,11 @@ pub enum ModelsCommand {
         /// Model to install (default: all-minilm-l6-v2)
         #[arg(long, default_value = "all-minilm-l6-v2")]
         model: String,
-        /// Custom mirror URL for downloading
-        #[arg(long)]
+        /// Custom HTTP(S) mirror base URL for downloading
+        #[arg(long, conflicts_with = "from_file")]
         mirror: Option<String>,
-        /// Install from local file (for air-gapped environments)
-        #[arg(long)]
+        /// Install from local model directory (for air-gapped environments)
+        #[arg(long, conflicts_with = "mirror")]
         from_file: Option<PathBuf>,
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
@@ -958,7 +1112,7 @@ pub enum ModelsCommand {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -976,12 +1130,12 @@ pub enum ModelsCommand {
     },
     /// Check for model updates
     CheckUpdate {
-        /// Output as JSON
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
 }
 
@@ -992,7 +1146,7 @@ pub enum MappingsAction {
     List {
         /// Source name
         source: String,
-        /// Output as JSON
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -1105,7 +1259,7 @@ pub enum AnalyticsCommand {
     Validate {
         #[command(flatten)]
         common: AnalyticsCommon,
-        /// Attempt automatic repair of detected drift
+        /// Attempt safe automatic repair of fixable Track A issues and report skipped non-fixable problems
         #[arg(long)]
         fix: bool,
     },
@@ -1145,7 +1299,7 @@ pub struct AnalyticsCommon {
     pub source: Option<String>,
 
     // ---- Output ----
-    /// Output as JSON (robot-safe)
+    /// Output as JSON (for automation)
     #[arg(long, visible_alias = "robot")]
     pub json: bool,
 
@@ -1169,6 +1323,26 @@ impl From<AnalyticsBucketing> for analytics::GroupBy {
     }
 }
 
+fn normalized_analytics_agent_arg(agent: &str) -> String {
+    let trimmed = agent.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn analytics_source_filter_from_common_input(source: Option<&str>) -> analytics::SourceFilter {
+    match source.map(crate::sources::provenance::SourceFilter::parse) {
+        None | Some(crate::sources::provenance::SourceFilter::All) => analytics::SourceFilter::All,
+        Some(crate::sources::provenance::SourceFilter::Local) => analytics::SourceFilter::Local,
+        Some(crate::sources::provenance::SourceFilter::Remote) => analytics::SourceFilter::Remote,
+        Some(crate::sources::provenance::SourceFilter::SourceId(source_id)) => {
+            analytics::SourceFilter::Specific(source_id)
+        }
+    }
+}
+
 impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
     fn from(common: &AnalyticsCommon) -> Self {
         let now_ms = std::time::SystemTime::now()
@@ -1184,19 +1358,16 @@ impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
 
         let until_ms: Option<i64> = common.until.as_deref().and_then(parse_datetime_str);
 
-        let source = match common.source.as_deref() {
-            None | Some("all") => analytics::SourceFilter::All,
-            Some("local") => analytics::SourceFilter::Local,
-            Some("remote") => analytics::SourceFilter::Remote,
-            Some(specific) => analytics::SourceFilter::Specific(specific.into()),
-        };
-
         analytics::AnalyticsFilter {
             since_ms,
             until_ms,
-            agents: common.agent.clone(),
-            source,
-            workspace_ids: vec![], // workspace lookup not yet wired
+            agents: common
+                .agent
+                .iter()
+                .map(|agent| normalized_analytics_agent_arg(agent))
+                .collect(),
+            source: analytics_source_filter_from_common_input(common.source.as_deref()),
+            workspace_ids: vec![],
         }
     }
 }
@@ -1491,6 +1662,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "until",
         "days",
         "today",
+        "yesterday",
         "week",
         "full",
         "watch",
@@ -1528,6 +1700,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "theme",
         // Added flags
         "watch-once",
+        "watch-interval",
         "semantic",
         "embedder",
         "idempotency-key",
@@ -1559,6 +1732,31 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "i-understand-unencrypted-risks",
         "include-attachments",
         "no-open",
+        "stale-threshold",
+        "by-source",
+        "robot-meta",
+        "robot-format",
+        "max-content-length",
+        "fast-only",
+        "quality-only",
+        "once",
+        "reset-state",
+        "asciicast",
+        "inline",
+        "ui-height",
+        "anchor",
+        "record-macro",
+        "play-macro",
+        "group-by",
+        "mirror",
+        "from-file",
+        "repair",
+        "purge",
+        "preset",
+        "no-test",
+        "no-index",
+        "skip-existing",
+        "hosts",
     ];
 
     // Subcommand aliases for common mistakes
@@ -1569,6 +1767,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         ("q", "search"),
         ("lookup", "search"),
         ("grep", "search"),
+        ("session", "sessions"),
         // Stats aliases
         ("ls", "stats"),
         ("list", "stats"),
@@ -1799,11 +1998,13 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             ],
         ),
         "sources" => (
-            &["list", "add", "remove", "sync", "status", "mappings", "discover", "wizard"],
+            &[
+                "list", "add", "remove", "doctor", "sync", "mappings", "discover", "setup",
+            ],
             &[
                 "cass sources list --json",
                 "cass sources add user@host --name myserver",
-                "cass sources status --json",
+                "cass sources doctor --json",
             ],
         ),
         "models" => (
@@ -1818,10 +2019,7 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             &["chatgpt"],
             &["cass import chatgpt /path/to/conversations.json"],
         ),
-        _ => (
-            &[],
-            &["cass --help"],
-        ),
+        _ => (&[], &["cass --help"]),
     };
 
     let mut msg = format!(
@@ -1935,6 +2133,8 @@ fn detect_command_intent(raw_str: &str) -> String {
         || raw_str.contains("grep")
     {
         "search for sessions or messages".to_string()
+    } else if raw_str.contains("session") || raw_str.contains("current") {
+        "discover or list session files".to_string()
     } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
         "get robot-mode documentation".to_string()
     } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
@@ -1968,6 +2168,12 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass search \"database\" --robot --since 2024-01-01",
             "cass search \"TODO\" --robot --workspace /path/to/project",
         ]
+    } else if intent.contains("session") {
+        vec![
+            "cass sessions --current --json",
+            "cass sessions --workspace /path/to/project --json --limit 5",
+            "cass sessions --json --limit 10",
+        ]
     } else if intent.contains("documentation") {
         vec![
             "cass robot-docs commands",
@@ -1978,9 +2184,8 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
     } else if intent.contains("statistics") || intent.contains("list") {
         vec![
             "cass stats --robot",
-            "cass stats --robot --agent claude",
-            "cass stats --robot --workspace /path",
-            "cass stats --robot --since 2024-01-01",
+            "cass stats --robot --source local",
+            "cass stats --robot --by-source",
         ]
     } else if intent.contains("index") {
         vec![
@@ -1990,16 +2195,15 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
         ]
     } else if intent.contains("view") {
         vec![
-            "cass view <session-id> --robot",
-            "cass view <session-id> --robot --full",
-            "cass view <session-id> --robot --fields content,timestamp",
+            "cass view <session-path> --robot",
+            "cass view <session-path> -n 42 --json",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
     } else if intent.contains("diagnostics") {
         vec!["cass diag --robot", "cass diag --robot --verbose"]
     } else if intent.contains("status") {
-        vec!["cass status --robot", "cass status --robot --watch"]
+        vec!["cass status --robot"]
     } else if intent.contains("health") {
         vec!["cass health --json"]
     } else {
@@ -2482,20 +2686,75 @@ async fn execute_cli(
         ));
     }
 
-    // Auto-quiet in robot mode: suppress INFO logs for clean JSON output
-    // This ensures AI agents get parseable stdout without log noise on stderr
-    let robot_mode = is_robot_mode(&command);
+    // Auto-quiet in robot mode: suppress INFO/WARN logs for clean JSON output.
+    // WARN was previously allowed through, but even on stderr it breaks JSON
+    // consumers that merge stderr into stdout (e.g., `cass index --json 2>&1`).
+    // Only errors are important enough to surface in machine-readable mode.
+    let robot_mode = is_robot_mode(&command, cli);
     let filter = if cli.quiet || robot_mode {
         // Robot mode implies quiet unless verbose is explicitly requested
         if cli.verbose {
             EnvFilter::new("debug")
         } else {
-            EnvFilter::new("warn")
+            EnvFilter::new("error")
         }
     } else if cli.verbose {
         EnvFilter::new("debug")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Suppress frankensqlite internal telemetry that spams at INFO level.
+            // EnvFilter uses "::" as the hierarchy separator, so "fsqlite=warn" covers
+            // fsqlite::runtime, fsqlite::cx, etc.  Crate-level targets like fsqlite_vdbe
+            // and fsqlite_core need their own directives.  Custom dot-separated targets
+            // (fsqlite.statement_reuse, fsqlite.compat, etc.) are NOT matched by the
+            // hierarchical prefix, so each must be listed explicitly.
+            EnvFilter::new(concat!(
+                "info",
+                // Hierarchical (::) targets
+                ",fsqlite=warn",
+                ",fsqlite_core=warn",
+                ",fsqlite_vdbe=warn",
+                ",fsqlite_mvcc=warn",
+                ",fsqlite_pager=warn",
+                ",fsqlite_func=warn",
+                ",fsqlite_vfs=warn",
+                ",fsqlite_wal=warn",
+                ",fsqlite_c_api=warn",
+                ",fsqlite_planner=warn",
+                ",fsqlite_types=warn",
+                ",fsqlite_observability=warn",
+                // Dot-separated custom targets
+                ",fsqlite.compat=warn",
+                ",fsqlite.compat_trace=warn",
+                ",fsqlite.statement_reuse=warn",
+                ",fsqlite.statement=warn",
+                ",fsqlite.execution=warn",
+                ",fsqlite.execute_path=warn",
+                ",fsqlite.plan=warn",
+                ",fsqlite.planner=warn",
+                ",fsqlite.planner_runtime=warn",
+                ",fsqlite.parse=warn",
+                ",fsqlite.provenance=warn",
+                ",fsqlite.dp=warn",
+                ",fsqlite.udf=warn",
+                ",fsqlite.vdbe=warn",
+                ",fsqlite.rcu=warn",
+                ",fsqlite.seqlock=warn",
+                ",fsqlite.left_right=warn",
+                ",fsqlite.flat_combine=warn",
+                ",fsqlite.commit_combine=warn",
+                ",fsqlite.snapshot_publication=warn",
+                ",fsqlite.wal_publication=warn",
+                ",fsqlite.storage_wiring=warn",
+                ",fsqlite.cx_propagation=warn",
+                ",fsqlite.sketch_telemetry=warn",
+                ",fsqlite.time_travel=warn",
+                ",fsqlite.trace_export=warn",
+                ",fsqlite.txn_slot=warn",
+                ",fsqlite.evidence=warn",
+                ",fsqlite.lab_schedule=warn",
+            ))
+        })
     };
 
     match &command {
@@ -2650,25 +2909,28 @@ async fn execute_cli(
                     force_rebuild,
                     watch,
                     watch_once,
+                    watch_interval,
                     data_dir,
                     semantic,
                     build_hnsw,
                     embedder,
-                    json,
                     idempotency_key,
+                    json,
                 } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
                         cli.db.clone(),
                         full,
                         force_rebuild,
                         watch,
                         watch_once,
+                        watch_interval,
                         data_dir,
                         semantic,
                         build_hnsw,
                         embedder,
                         progress,
-                        json,
+                        structured_format,
                         idempotency_key,
                     )?;
                 }
@@ -2679,7 +2941,6 @@ async fn execute_cli(
                     limit,
                     offset,
                     json,
-                    robot_format,
                     robot_meta,
                     fields,
                     max_content_length,
@@ -2765,6 +3026,10 @@ async fn execute_cli(
                         tier_mode,
                     };
 
+                    let effective_format = cli
+                        .robot_format
+                        .unwrap_or_else(|| robot_format_from_env().unwrap_or(RobotFormat::Json));
+
                     run_cli_search(
                         &query,
                         &agent,
@@ -2772,7 +3037,7 @@ async fn execute_cli(
                         &limit,
                         &offset,
                         &json,
-                        robot_format,
+                        Some(effective_format),
                         robot_meta,
                         fields,
                         max_content_length,
@@ -2810,10 +3075,11 @@ async fn execute_cli(
                     source,
                     by_source,
                 } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_stats(
                         &data_dir,
                         cli.db.clone(),
-                        json,
+                        structured_format,
                         source.as_deref(),
                         by_source,
                     )?;
@@ -2823,7 +3089,8 @@ async fn execute_cli(
                     json,
                     verbose,
                 } => {
-                    run_diag(&data_dir, cli.db.clone(), json, verbose)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_diag(&data_dir, cli.db.clone(), structured_format, verbose)?;
                 }
                 Commands::Status {
                     data_dir,
@@ -2831,15 +3098,31 @@ async fn execute_cli(
                     robot_meta,
                     stale_threshold,
                 } => {
-                    run_status(&data_dir, cli.db.clone(), json, stale_threshold, robot_meta)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_status(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        stale_threshold,
+                        robot_meta,
+                    )?;
                 }
                 Commands::View {
                     path,
+                    source,
                     line,
                     context,
                     json,
                 } => {
-                    run_view(&path, line, context, json || robot_mode)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_view(
+                        &path,
+                        cli.db.clone(),
+                        source.as_deref(),
+                        line,
+                        context,
+                        structured_format,
+                    )?;
                 }
                 Commands::Pages {
                     export_only,
@@ -2859,7 +3142,6 @@ async fn execute_cli(
                     fail_on_secrets,
                     secrets_allow,
                     secrets_deny,
-                    json,
                     verbose,
                     no_encryption,
                     i_understand_unencrypted_risks,
@@ -2870,7 +3152,10 @@ async fn execute_cli(
                     config,
                     validate_config,
                     example_config,
+                    json,
                 } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    let robot_mode_here = structured_format.is_some() || robot_mode;
                     // Handle --example-config (show example config and exit)
                     if example_config {
                         println!("{}", crate::pages::config_input::example_config());
@@ -2891,6 +3176,10 @@ async fn execute_cli(
                             ),
                             retryable: false,
                         })?;
+
+                        if include_attachments {
+                            pages_config.bundle.include_attachments = true;
+                        }
 
                         if let Some(target) = target {
                             pages_config.deployment.target = target.as_config_value().to_string();
@@ -2963,12 +3252,12 @@ async fn execute_cli(
                         }
 
                         if !validation.valid {
-                            if json || robot_mode {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&validation).unwrap_or_default()
-                                );
-                            } else {
+                            if let Some(fmt) = structured_format {
+                                output_structured_value(
+                                    serde_json::to_value(&validation).unwrap_or_default(),
+                                    fmt,
+                                )?;
+                            } else if robot_mode_here {
                                 eprintln!("Configuration errors:");
                                 for err in &validation.errors {
                                     eprintln!("  - {}", err);
@@ -2984,7 +3273,10 @@ async fn execute_cli(
                         }
 
                         // Print warnings
-                        if !validation.warnings.is_empty() && !json && !robot_mode {
+                        if !validation.warnings.is_empty()
+                            && structured_format.is_none()
+                            && !robot_mode_here
+                        {
                             eprintln!("Warnings:");
                             for warn in &validation.warnings {
                                 eprintln!("  - {}", warn);
@@ -2993,15 +3285,7 @@ async fn execute_cli(
                         }
 
                         // Get database path
-                        let db_path = cli.db.clone().unwrap_or_else(|| {
-                            directories::ProjectDirs::from(
-                                "com",
-                                "dicklesworthstone",
-                                "coding-agent-search",
-                            )
-                            .map(|dirs| dirs.data_dir().join("agent_search.db"))
-                            .unwrap_or_else(default_db_path)
-                        });
+                        let db_path = cli.db.clone().unwrap_or_else(default_db_path);
 
                         // Convert config to WizardState and run export
                         let wizard_state =
@@ -3021,7 +3305,7 @@ async fn execute_cli(
                             &wizard_state,
                             &db_path,
                             dry_run,
-                            json || robot_mode,
+                            structured_format,
                             verbose,
                         )
                         .map_err(|e| CliError {
@@ -3033,6 +3317,20 @@ async fn execute_cli(
                         })?;
 
                         return Ok(());
+                    }
+
+                    if include_attachments {
+                        return Err(CliError {
+                            code: 2,
+                            kind: "pages",
+                            message: "--include-attachments is not implemented for pages exports"
+                                .to_string(),
+                            hint: Some(
+                                "Remove --include-attachments. The current pages pipeline cannot extract attachment blobs from the source database yet."
+                                    .to_string(),
+                            ),
+                            retryable: false,
+                        });
                     }
 
                     // Handle --validate-config without --config
@@ -3069,7 +3367,7 @@ async fn execute_cli(
                     }
 
                     // Check for unencrypted export in robot mode
-                    if no_encryption && (json || robot_mode) && !i_understand_unencrypted_risks {
+                    if no_encryption && robot_mode_here && !i_understand_unencrypted_risks {
                         let error = crate::pages::confirmation::robot_mode_blocked_error();
                         eprintln!(
                             "{}",
@@ -3098,11 +3396,11 @@ async fn execute_cli(
                                 retryable: false,
                             })?;
 
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&result).unwrap_or_default()
-                            );
+                        if let Some(fmt) = structured_format {
+                            output_structured_value(
+                                serde_json::to_value(&result).unwrap_or_default(),
+                                fmt,
+                            )?;
                         } else {
                             crate::pages::verify::print_result(&result, verbose);
                         }
@@ -3120,15 +3418,7 @@ async fn execute_cli(
                             });
                         }
                     } else if scan_secrets {
-                        let db_path = cli.db.clone().unwrap_or_else(|| {
-                            directories::ProjectDirs::from(
-                                "com",
-                                "dicklesworthstone",
-                                "coding-agent-search",
-                            )
-                            .map(|dirs| dirs.data_dir().join("agent_search.db"))
-                            .unwrap_or_else(default_db_path)
-                        });
+                        let db_path = cli.db.clone().unwrap_or_else(default_db_path);
 
                         let workspaces_path = workspaces
                             .clone()
@@ -3161,7 +3451,7 @@ async fn execute_cli(
                             &db_path,
                             &filters,
                             &config,
-                            json,
+                            structured_format.is_some(),
                             fail_on_secrets,
                         )
                         .map_err(|e| CliError {
@@ -3173,7 +3463,7 @@ async fn execute_cli(
                         })?;
                     } else if let Some(output_path) = export_only {
                         // Interactive unencrypted export confirmation (non-robot mode)
-                        if no_encryption && !json && !robot_mode {
+                        if no_encryption && structured_format.is_none() && !robot_mode_here {
                             use console::style;
                             use std::io::Write;
 
@@ -3312,6 +3602,9 @@ async fn execute_cli(
 
                         // Wizard mode: pass flags
                         let mut wizard = crate::pages::wizard::PagesWizard::new();
+                        if let Some(db_path) = cli.db.clone() {
+                            wizard.set_db_path(db_path);
+                        }
                         if no_encryption {
                             wizard.set_no_encryption(true);
                         }
@@ -3347,7 +3640,16 @@ async fn execute_cli(
                     }
                 }
                 Commands::Analytics(subcmd) => {
-                    run_analytics(subcmd, cli.db.clone())?;
+                    run_analytics(subcmd, cli.db.clone(), cli)?;
+                }
+                #[cfg(unix)]
+                Commands::Daemon {
+                    socket,
+                    idle_timeout,
+                    max_connections,
+                    data_dir,
+                } => {
+                    run_daemon(socket, idle_timeout, max_connections, data_dir)?;
                 }
                 _ => {}
             }
@@ -3376,10 +3678,12 @@ async fn execute_cli(
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
                 }
                 Commands::Capabilities { json } => {
-                    run_capabilities(json)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_capabilities(structured_format)?;
                 }
                 Commands::ApiVersion { json } => {
-                    run_api_version(json)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_api_version(structured_format)?;
                 }
                 Commands::State {
                     data_dir,
@@ -3387,18 +3691,33 @@ async fn execute_cli(
                     robot_meta,
                     stale_threshold,
                 } => {
-                    run_status(&data_dir, None, json, stale_threshold, robot_meta)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_status(
+                        &data_dir,
+                        None,
+                        structured_format,
+                        stale_threshold,
+                        robot_meta,
+                    )?;
                 }
                 Commands::Introspect { json } => {
-                    run_introspect(json)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_introspect(structured_format)?;
                 }
                 Commands::Health {
                     data_dir,
-                    json,
                     robot_meta,
                     stale_threshold,
+                    json,
                 } => {
-                    run_health(&data_dir, cli.db.clone(), json, stale_threshold, robot_meta)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_health(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        stale_threshold,
+                        robot_meta,
+                    )?;
                 }
                 Commands::Doctor {
                     data_dir,
@@ -3407,26 +3726,81 @@ async fn execute_cli(
                     verbose,
                     force_rebuild,
                 } => {
-                    run_doctor(&data_dir, cli.db.clone(), json, fix, verbose, force_rebuild)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_doctor(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        fix,
+                        verbose,
+                        force_rebuild,
+                    )?;
                 }
                 Commands::Context {
                     path,
+                    source,
                     data_dir,
-                    json,
                     limit,
+                    json,
                 } => {
-                    run_context(&path, &data_dir, cli.db.clone(), json, limit)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_context(
+                        &path,
+                        source.as_deref(),
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        limit,
+                    )?;
+                }
+                Commands::Sessions {
+                    workspace,
+                    current,
+                    limit,
+                    json,
+                    data_dir,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_sessions(
+                        workspace.as_ref(),
+                        current,
+                        limit,
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                    )?;
+                }
+                Commands::Resume {
+                    path,
+                    agent,
+                    exec,
+                    shell,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_resume(&path, agent.as_deref(), exec, shell, structured_format)?;
                 }
                 Commands::Export {
                     path,
+                    source,
                     format,
                     output,
                     include_tools,
+                    include_skills,
                 } => {
-                    run_export(&path, format, output.as_deref(), include_tools)?;
+                    run_export(
+                        &path,
+                        cli.db.clone(),
+                        source.as_deref(),
+                        format,
+                        output.as_deref(),
+                        include_tools,
+                        include_skills,
+                    )?;
                 }
                 Commands::ExportHtml {
                     session,
+                    source,
                     output_dir,
                     filename,
                     encrypt,
@@ -3435,14 +3809,18 @@ async fn execute_cli(
                     include_tools,
                     show_timestamps,
                     no_cdns,
+                    include_skills,
                     theme,
                     dry_run,
                     explain,
                     open,
                     json,
                 } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_export_html(
                         &session,
+                        cli.db.clone(),
+                        source.as_deref(),
                         output_dir.as_deref(),
                         filename.as_deref(),
                         encrypt,
@@ -3451,20 +3829,30 @@ async fn execute_cli(
                         include_tools,
                         show_timestamps,
                         !no_cdns,
+                        include_skills,
                         &theme,
                         dry_run,
                         explain,
                         open,
-                        json,
+                        structured_format,
                     )?;
                 }
                 Commands::Expand {
                     path,
+                    source,
                     line,
                     context,
                     json,
                 } => {
-                    run_expand(&path, line, context, json)?;
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_expand(
+                        &path,
+                        cli.db.clone(),
+                        source.as_deref(),
+                        line,
+                        context,
+                        structured_format,
+                    )?;
                 }
                 Commands::Timeline {
                     since,
@@ -3476,6 +3864,7 @@ async fn execute_cli(
                     group_by,
                     source,
                 } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_timeline(
                         since.as_deref(),
                         until.as_deref(),
@@ -3483,23 +3872,25 @@ async fn execute_cli(
                         &agent,
                         &data_dir,
                         cli.db.clone(),
-                        json,
+                        structured_format,
                         group_by,
                         source,
                     )?;
                 }
                 Commands::Sources(subcmd) => {
-                    run_sources_command(subcmd)?;
+                    run_sources_command(subcmd, cli)?;
                 }
                 Commands::Models(subcmd) => {
                     let subcmd = subcmd.clone();
-                    let result =
-                        asupersync::runtime::spawn_blocking(move || run_models_command(subcmd))
-                            .await;
+                    let cli_clone = cli.clone();
+                    let result = asupersync::runtime::spawn_blocking(move || {
+                        run_models_command(subcmd, &cli_clone)
+                    })
+                    .await;
                     result?;
                 }
                 Commands::Import(subcmd) => {
-                    handle_import(subcmd).await?;
+                    handle_import(subcmd, cli).await?;
                 }
                 _ => {}
             }
@@ -3509,13 +3900,12 @@ async fn execute_cli(
     Ok(())
 }
 
-async fn handle_import(cmd: ImportCommand) -> CliResult<()> {
+async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
-        ImportCommand::Chatgpt {
-            path,
-            output_dir,
-            json,
-        } => import_chatgpt_export(&path, output_dir.as_deref(), json).await,
+        ImportCommand::Chatgpt { path, output_dir } => {
+            let structured_format = cli.robot_format.or_else(robot_format_from_env);
+            import_chatgpt_export(&path, output_dir.as_deref(), structured_format).await
+        }
     }
 }
 
@@ -3532,10 +3922,10 @@ async fn handle_import(cmd: ImportCommand) -> CliResult<()> {
 /// { "command": "analytics/<sub>", "data": { ... }, "_meta": { "elapsed_ms": N } }
 /// ```
 ///
-/// Implementation of the actual data queries is deferred to child beads;
-/// these stubs return a well-formed "not yet implemented" response so
-/// downstream consumers can parse the envelope immediately.
-fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>) -> CliResult<()> {
+/// The data for each analytics subcommand is produced by dedicated helpers
+/// below; this dispatcher only normalizes envelopes, shared filters, and
+/// structured output across the analytics surface.
+fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> CliResult<()> {
     use std::time::Instant;
 
     let start = Instant::now();
@@ -3549,8 +3939,6 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>) -> CliResult<(
         AnalyticsCommand::Rebuild { common, .. } => ("rebuild", common),
         AnalyticsCommand::Validate { common, .. } => ("validate", common),
     };
-
-    let json_mode = common.json;
 
     // Build a summary of the active filters for _meta.
     let filters = analytics_build_filters(common);
@@ -3579,6 +3967,8 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>) -> CliResult<(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
+    let structured_format = resolve_subcommand_structured_format(cli, common.json);
+
     let envelope = serde_json::json!({
         "command": format!("analytics/{label}"),
         "data": data,
@@ -3589,11 +3979,8 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>) -> CliResult<(
         }
     });
 
-    if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&envelope).unwrap_or_default()
-        );
+    if let Some(fmt) = structured_format {
+        return output_structured_value(envelope, fmt);
     } else {
         use colored::Colorize;
         let heading = match &cmd {
@@ -3635,15 +4022,80 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
         f.push(format!("days={d}"));
     }
     for a in &common.agent {
-        f.push(format!("agent={a}"));
+        f.push(format!("agent={}", normalized_analytics_agent_arg(a)));
     }
     for w in &common.workspace {
-        f.push(format!("workspace={w}"));
+        let trimmed = w.trim();
+        if !trimmed.is_empty() {
+            f.push(format!("workspace={trimmed}"));
+        }
     }
-    if let Some(s) = &common.source {
-        f.push(format!("source={s}"));
+    if common.source.is_some() {
+        let source_label = match analytics_source_filter_from_common_input(common.source.as_deref())
+        {
+            analytics::SourceFilter::All => "all".to_string(),
+            analytics::SourceFilter::Local => "local".to_string(),
+            analytics::SourceFilter::Remote => "remote".to_string(),
+            analytics::SourceFilter::Specific(source_id) => source_id,
+        };
+        f.push(format!("source={source_label}"));
     }
     f
+}
+
+fn resolve_analytics_workspace_ids(
+    conn: &frankensqlite::Connection,
+    workspace_paths: &[String],
+) -> CliResult<Vec<i64>> {
+    use frankensqlite::compat::{ParamValue, RowExt};
+
+    let requested_paths: Vec<String> = workspace_paths
+        .iter()
+        .map(|workspace| workspace.trim())
+        .filter(|workspace| !workspace.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if requested_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !analytics::query::table_exists(conn, "workspaces") {
+        return Ok(vec![-1]);
+    }
+
+    let mut workspace_ids = std::collections::BTreeSet::new();
+    for workspace in requested_paths {
+        let ids: Vec<i64> = conn
+            .query_map_collect(
+                "SELECT id FROM workspaces WHERE path = ?1",
+                &[ParamValue::from(workspace.as_str())],
+                |row: &frankensqlite::Row| row.get_typed(0),
+            )
+            .map_err(|e| CliError {
+                code: 9,
+                kind: "db-error",
+                message: format!("Failed to resolve analytics workspace filter '{workspace}': {e}"),
+                hint: Some("Check that the workspaces table exists and is readable.".into()),
+                retryable: false,
+            })?;
+        workspace_ids.extend(ids);
+    }
+
+    if workspace_ids.is_empty() {
+        Ok(vec![-1])
+    } else {
+        Ok(workspace_ids.into_iter().collect())
+    }
+}
+
+fn analytics_query_filter(
+    conn: &frankensqlite::Connection,
+    common: &AnalyticsCommon,
+) -> CliResult<analytics::AnalyticsFilter> {
+    let mut filter = analytics::AnalyticsFilter::from(common);
+    filter.workspace_ids = resolve_analytics_workspace_ids(conn, &common.workspace)?;
+    Ok(filter)
 }
 
 /// Open a read-only frankensqlite connection for analytics queries.
@@ -3651,10 +4103,25 @@ fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<frankensqlite::Connection> {
+    open_franken_cli_read_db(
+        analytics_db_path(data_dir, db_path_override),
+        "analytics",
+        Duration::from_secs(1),
+    )
+}
+
+fn analytics_db_path(data_dir: &Option<PathBuf>, db_path_override: Option<&PathBuf>) -> PathBuf {
     let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
-    let path = db_path_override
+    db_path_override
         .cloned()
-        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+        .unwrap_or_else(|| data_dir.join("agent_search.db"))
+}
+
+fn open_franken_cli_read_db(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+) -> CliResult<frankensqlite::Connection> {
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -3667,13 +4134,178 @@ fn open_franken_analytics_db(
             retryable: true,
         });
     }
-    frankensqlite::Connection::open(path.to_string_lossy().as_ref()).map_err(|e| CliError {
-        code: 9,
-        kind: "db-open",
-        message: format!("Failed to open database at {}: {e}", path.display()),
-        hint: None,
-        retryable: false,
-    })
+
+    let conn = match crate::storage::sqlite::open_franken_readonly_storage_with_timeout(
+        &path,
+        busy_timeout,
+    ) {
+        Ok(storage) => storage.into_raw(),
+        Err(err) => {
+            let readonly_retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
+            match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+                &path,
+                busy_timeout,
+            ) {
+                Ok(conn) => conn,
+                Err(raw_readonly_err) => {
+                    let raw_readonly_retryable =
+                        crate::storage::sqlite::retryable_franken_anyhow(&raw_readonly_err);
+                    crate::storage::sqlite::open_franken_raw_connection_with_timeout(
+                        &path,
+                        busy_timeout,
+                    )
+                    .map_err(|raw_err| CliError {
+                        code: 9,
+                        kind: "db-open",
+                        message: format!(
+                            "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err}); raw open failed ({raw_err})",
+                            path.display()
+                        ),
+                        hint: None,
+                        retryable: readonly_retryable
+                            || raw_readonly_retryable
+                            || crate::storage::sqlite::retryable_franken_anyhow(&raw_err),
+                    })?
+                }
+            }
+        }
+    };
+
+    let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
+    let _ = conn.execute("PRAGMA query_only = 1;");
+
+    Ok(conn)
+}
+
+fn close_franken_cli_read_db(
+    mut conn: frankensqlite::Connection,
+    path: &Path,
+    reason: &str,
+) -> CliResult<()> {
+    if let Err(err) = conn.close_in_place() {
+        warn!(
+            error = %err,
+            db_path = %path.display(),
+            reason,
+            "close_in_place failed for CLI read probe; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
+    }
+    Ok(())
+}
+
+fn franken_query_row_map_retry<T, F>(
+    conn: &frankensqlite::Connection,
+    sql: &str,
+    params: &[frankensqlite::compat::ParamValue],
+    map: F,
+) -> Result<T, frankensqlite::FrankenError>
+where
+    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+{
+    let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        match conn.query_row_map(sql, params, |row| map(row)) {
+            Ok(value) => return Ok(value),
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn franken_query_map_collect_retry<T, F>(
+    conn: &frankensqlite::Connection,
+    sql: &str,
+    params: &[frankensqlite::compat::ParamValue],
+    map: F,
+) -> Result<Vec<T>, frankensqlite::FrankenError>
+where
+    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+{
+    let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        match conn.query_map_collect(sql, params, |row| map(row)) {
+            Ok(values) => return Ok(values),
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn fresh_franken_count_retry(
+    path: &Path,
+    reason: &str,
+    busy_timeout: Duration,
+    sql: &str,
+    params: &[frankensqlite::compat::ParamValue],
+) -> Option<i64> {
+    let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        let conn = match open_franken_cli_read_db(path.to_path_buf(), reason, busy_timeout) {
+            Ok(conn) => conn,
+            Err(err) => {
+                if !err.retryable {
+                    return None;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
+                continue;
+            }
+        };
+
+        let result = conn.query_row_map(sql, params, |row| row.get_typed::<i64>(0));
+        let _ = close_franken_cli_read_db(conn, path, reason);
+        match result {
+            Ok(value) => return Some(value),
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3686,7 +4318,7 @@ fn run_analytics_status(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_status(&conn, &filter)
         .map(|r| r.to_json())
@@ -3710,7 +4342,7 @@ fn run_analytics_tokens(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
         .map(|r| r.to_cli_json())
@@ -3736,7 +4368,7 @@ fn run_analytics_rebuild(
     _force: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::FrankenStorage;
 
     let data_dir = common.data_dir.clone().unwrap_or_else(default_data_dir);
     let db_path = db_path_override
@@ -3759,7 +4391,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let mut storage = SqliteStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: "db-error",
         message: format!("Failed to open database: {e}"),
@@ -3811,7 +4443,7 @@ fn run_analytics_tools(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
@@ -3828,61 +4460,241 @@ fn run_analytics_tools(
 // analytics validate (br-z9fse.3.5)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct AnalyticsValidationSummary {
+    errors: usize,
+    warnings: usize,
+    drift_entries: usize,
+    buckets_checked: usize,
+    buckets_total: usize,
+}
+
+fn analytics_validation_summary(
+    report: &analytics::ValidationReport,
+) -> AnalyticsValidationSummary {
+    AnalyticsValidationSummary {
+        errors: report.count_failures(analytics::validate::Severity::Error),
+        warnings: report.count_failures(analytics::validate::Severity::Warning),
+        drift_entries: report.drift.len(),
+        buckets_checked: report._meta.sampling.buckets_checked,
+        buckets_total: report._meta.sampling.buckets_total,
+    }
+}
+
+fn annotate_deferred_analytics_failures(
+    report: &mut analytics::ValidationReport,
+    deferred_check_ids: &std::collections::BTreeSet<String>,
+) {
+    if deferred_check_ids.is_empty() {
+        return;
+    }
+
+    for check in &mut report.checks {
+        if !check.ok
+            && check.severity == analytics::validate::Severity::Error
+            && deferred_check_ids.contains(&check.id)
+        {
+            check.severity = analytics::validate::Severity::Warning;
+            if !check
+                .details
+                .contains("deferred because automatic Track B rebuild is not available")
+            {
+                check.details.push_str(
+                    " This failure is currently deferred because automatic Track B rebuild is not available yet.",
+                );
+            }
+        }
+    }
+}
+
+fn analytics_track_a_rebuild_safe(conn: &frankensqlite::Connection) -> bool {
+    ["messages", "conversations", "agents"]
+        .into_iter()
+        .all(|table| analytics::query::table_exists(conn, table))
+}
+
+fn emit_analytics_validate_summary(label: &str, summary: &AnalyticsValidationSummary) {
+    use colored::Colorize;
+
+    if summary.errors > 0 {
+        eprintln!(
+            "  {label} {} {} error(s), {} warning(s), {} drift entries",
+            "FAIL".red().bold(),
+            summary.errors,
+            summary.warnings,
+            summary.drift_entries
+        );
+    } else if summary.warnings > 0 {
+        eprintln!(
+            "  {label} {} {} warning(s), {} drift entries",
+            "WARN".yellow().bold(),
+            summary.warnings,
+            summary.drift_entries
+        );
+    } else {
+        eprintln!("  {label} {} all checks passed", "OK".green().bold());
+    }
+}
+
+fn analytics_perf_json(
+    perf_ts: &analytics::validate::PerfMeasurement,
+    perf_bd: &analytics::validate::PerfMeasurement,
+) -> serde_json::Value {
+    serde_json::json!({
+        "timeseries": {
+            "elapsed_ms": perf_ts.elapsed_ms,
+            "budget_ms": perf_ts.budget_ms,
+            "within_budget": perf_ts.within_budget,
+            "error": perf_ts.error,
+            "details": perf_ts.details,
+        },
+        "breakdown": {
+            "elapsed_ms": perf_bd.elapsed_ms,
+            "budget_ms": perf_bd.budget_ms,
+            "within_budget": perf_bd.within_budget,
+            "error": perf_bd.error,
+            "details": perf_bd.details,
+        }
+    })
+}
+
 /// Run `cass analytics validate` — rollup invariant checks and drift detection.
 fn run_analytics_validate(
     common: &AnalyticsCommon,
-    _fix: bool,
+    fix: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
+    use crate::storage::sqlite::FrankenStorage;
+    use std::collections::BTreeSet;
+
+    let config = if fix {
+        analytics::ValidateConfig::deep()
+    } else {
+        analytics::ValidateConfig::default()
+    };
+    let db_path = analytics_db_path(&common.data_dir, db_path_override);
+
+    let pre_conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
+    let pre_report = analytics::validate::run_validation(&pre_conn, &config);
+    let pre_summary = analytics_validation_summary(&pre_report);
+    let repair_plan = fix.then(|| analytics::validate::build_repair_plan(&pre_report));
+
+    let mut applied_repairs = Vec::new();
+    let mut skipped_repairs = Vec::new();
+    let mut deferred_check_ids = BTreeSet::new();
+
+    if let Some(plan) = repair_plan.as_ref() {
+        for decision in &plan.decisions {
+            match decision.kind {
+                analytics::validate::RepairKind::RebuildTrackA => {
+                    if analytics_track_a_rebuild_safe(&pre_conn) {
+                        let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                            code: 9,
+                            kind: "db-error",
+                            message: format!("Failed to open database for analytics repair: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
+                        let rebuild = storage.rebuild_analytics().map_err(|e| CliError {
+                            code: 9,
+                            kind: "repair-error",
+                            message: format!("Analytics auto-repair failed: {e}"),
+                            hint: Some(
+                                "Track A rebuild could not complete. Inspect the database and retry with 'cass analytics rebuild --json'."
+                                    .into(),
+                            ),
+                            retryable: true,
+                        })?;
+                        applied_repairs.push(serde_json::json!({
+                            "kind": "rebuild_track_a",
+                            "check_ids": decision.check_ids,
+                            "reason": decision.reason,
+                            "result": {
+                                "message_metrics_rows": rebuild.message_metrics_rows,
+                                "usage_hourly_rows": rebuild.usage_hourly_rows,
+                                "usage_daily_rows": rebuild.usage_daily_rows,
+                                "usage_models_daily_rows": rebuild.usage_models_daily_rows,
+                                "elapsed_ms": rebuild.elapsed_ms,
+                                "rows_per_sec": rebuild.messages_per_sec,
+                            }
+                        }));
+                    } else {
+                        skipped_repairs.push(serde_json::json!({
+                            "kind": "rebuild_track_a",
+                            "check_ids": decision.check_ids,
+                            "reason": "Track A rebuild was skipped because the raw cass source tables (messages, conversations, agents) are missing, so --fix cannot safely reconstruct analytics from this database.",
+                        }));
+                    }
+                }
+                analytics::validate::RepairKind::TrackAllRebuildUnavailable => {
+                    deferred_check_ids.extend(decision.check_ids.iter().cloned());
+                    skipped_repairs.push(serde_json::json!({
+                        "kind": "track_all_rebuild_unavailable",
+                        "check_ids": decision.check_ids,
+                        "reason": decision.reason,
+                    }));
+                }
+                analytics::validate::RepairKind::ManualReview => {
+                    skipped_repairs.push(serde_json::json!({
+                        "kind": "manual_review",
+                        "check_ids": decision.check_ids,
+                        "reason": decision.reason,
+                    }));
+                }
+            }
+        }
+    }
+
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
+    let mut report = analytics::validate::run_validation(&conn, &config);
+    if fix {
+        annotate_deferred_analytics_failures(&mut report, &deferred_check_ids);
+    }
+    let summary = analytics_validation_summary(&report);
 
-    let config = analytics::ValidateConfig::default();
-    let report = analytics::validate::run_validation(&conn, &config);
-
-    // Performance guardrails
     let perf_ts = analytics::validate::perf_query_guardrail(&conn);
     let perf_bd = analytics::validate::perf_breakdown_guardrail(&conn);
 
-    // Summary counts
-    let errors = report
-        .checks
-        .iter()
-        .filter(|c| c.severity == analytics::validate::Severity::Error)
-        .count();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|c| c.severity == analytics::validate::Severity::Warning)
-        .count();
-    let drift_entries = report.drift.len();
+    if fix {
+        emit_analytics_validate_summary("pre-fix:", &pre_summary);
+        for repair in &applied_repairs {
+            eprintln!(
+                "  fix: applied {} for {:?}",
+                repair["kind"].as_str().unwrap_or("repair"),
+                repair["check_ids"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            );
+        }
+        for repair in &skipped_repairs {
+            eprintln!(
+                "  fix: skipped {} for {:?}: {}",
+                repair["kind"].as_str().unwrap_or("repair"),
+                repair["check_ids"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                repair["reason"].as_str().unwrap_or("no reason recorded")
+            );
+        }
+        emit_analytics_validate_summary("post-fix:", &summary);
+    } else {
+        emit_analytics_validate_summary("", &summary);
+    }
 
-    // Human-readable stderr output
     {
         use colored::Colorize;
-        if errors > 0 {
-            eprintln!(
-                "  {} {} error(s), {} warning(s), {} drift entries",
-                "FAIL".red().bold(),
-                errors,
-                warnings,
-                drift_entries
-            );
-        } else if warnings > 0 {
-            eprintln!(
-                "  {} {} warning(s), {} drift entries",
-                "WARN".yellow().bold(),
-                warnings,
-                drift_entries
-            );
-        } else {
-            eprintln!("  {} all checks passed", "OK".green().bold());
-        }
-        let ts_status = if perf_ts.within_budget {
+        let ts_status = if perf_ts.error.is_some() {
+            "ERR".red().to_string()
+        } else if perf_ts.within_budget {
             "OK".green().to_string()
         } else {
             "SLOW".red().to_string()
         };
-        let bd_status = if perf_bd.within_budget {
+        let bd_status = if perf_bd.error.is_some() {
+            "ERR".red().to_string()
+        } else if perf_bd.within_budget {
             "OK".green().to_string()
         } else {
             "SLOW".red().to_string()
@@ -3893,29 +4705,29 @@ fn run_analytics_validate(
         );
     }
 
-    Ok(serde_json::json!({
-        "summary": {
-            "errors": errors,
-            "warnings": warnings,
-            "drift_entries": drift_entries,
-            "buckets_checked": report._meta.sampling.buckets_checked,
-            "buckets_total": report._meta.sampling.buckets_total,
-        },
+    let fix_json = fix.then(|| {
+        serde_json::json!({
+            "requested": true,
+            "validation_mode": report._meta.sampling.mode.clone(),
+            "attempted": repair_plan.as_ref().is_some_and(|plan| !plan.decisions.is_empty()),
+            "changed": !applied_repairs.is_empty(),
+            "pre_fix_summary": pre_summary.clone(),
+            "post_fix_summary": summary.clone(),
+            "applied_repairs": applied_repairs,
+            "skipped_repairs": skipped_repairs,
+        })
+    });
+
+    let mut payload = serde_json::json!({
+        "summary": summary.clone(),
         "checks": report.checks,
         "drift": report.drift,
-        "perf": {
-            "timeseries": {
-                "elapsed_ms": perf_ts.elapsed_ms,
-                "budget_ms": perf_ts.budget_ms,
-                "within_budget": perf_ts.within_budget,
-            },
-            "breakdown": {
-                "elapsed_ms": perf_bd.elapsed_ms,
-                "budget_ms": perf_bd.budget_ms,
-                "within_budget": perf_bd.within_budget,
-            }
-        }
-    }))
+        "perf": analytics_perf_json(&perf_ts, &perf_bd),
+    });
+    if let Some(fix_json) = fix_json {
+        payload["fix"] = fix_json;
+    }
+    Ok(payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -3929,7 +4741,7 @@ fn run_analytics_models(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
     let db_err = |e: crate::analytics::AnalyticsError| CliError {
         code: 9,
         kind: "db-error",
@@ -3981,7 +4793,7 @@ fn run_analytics_models(
 async fn import_chatgpt_export(
     export_path: &Path,
     output_dir: Option<&Path>,
-    json_output: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use std::io::Write;
 
@@ -4097,7 +4909,15 @@ async fn import_chatgpt_export(
         imported += 1;
     }
 
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         let result = serde_json::json!({
             "success": true,
             "total": total,
@@ -4123,6 +4943,240 @@ async fn import_chatgpt_export(
 }
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
+const STATE_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
+const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+struct StateDbSnapshot {
+    conversation_count: i64,
+    message_count: i64,
+    last_indexed_at: Option<i64>,
+    opened: bool,
+    open_error: Option<String>,
+    open_retryable: bool,
+    counts_skipped: bool,
+}
+
+fn probe_state_db(
+    db_path: &Path,
+    reason: &str,
+    timeout: Duration,
+    include_counts: bool,
+) -> StateDbSnapshot {
+    if !db_path.exists() {
+        return StateDbSnapshot::default();
+    }
+
+    let mut snapshot = StateDbSnapshot {
+        counts_skipped: !include_counts,
+        ..StateDbSnapshot::default()
+    };
+
+    let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
+        Ok(conn) => conn,
+        Err(err) => {
+            snapshot.open_error = Some(err.message);
+            snapshot.open_retryable = err.retryable;
+            return snapshot;
+        }
+    };
+
+    use frankensqlite::compat::RowExt;
+    use frankensqlite::params;
+
+    snapshot.opened = true;
+    snapshot.last_indexed_at = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok());
+    if include_counts {
+        snapshot.conversation_count = franken_query_row_map_retry(
+            &conn,
+            "SELECT COUNT(*) FROM conversations",
+            params![],
+            |r| r.get_typed(0),
+        )
+        .unwrap_or(0);
+        snapshot.message_count =
+            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", params![], |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
+        if snapshot.conversation_count == 0 {
+            snapshot.conversation_count = fresh_franken_count_retry(
+                db_path,
+                reason,
+                timeout,
+                "SELECT COUNT(*) FROM conversations",
+                params![],
+            )
+            .unwrap_or(0);
+        }
+        if snapshot.message_count == 0 {
+            snapshot.message_count = fresh_franken_count_retry(
+                db_path,
+                reason,
+                timeout,
+                "SELECT COUNT(*) FROM messages",
+                params![],
+            )
+            .unwrap_or(0);
+        }
+    }
+
+    if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
+        snapshot.open_error = Some(err.message);
+    }
+
+    snapshot
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveIndexRunDetails {
+    pid: Option<u32>,
+    started_at_ms: Option<i64>,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    job_id: Option<String>,
+    job_kind: Option<crate::search::asset_state::SearchMaintenanceJobKind>,
+    phase: Option<String>,
+}
+
+impl ActiveIndexRunDetails {
+    fn from_snapshot(
+        data_dir: &Path,
+        db_path: &Path,
+        snapshot: crate::search::asset_state::SearchMaintenanceSnapshot,
+    ) -> Option<Self> {
+        snapshot.active.then(|| Self {
+            pid: snapshot.pid,
+            started_at_ms: snapshot.started_at_ms,
+            data_dir: data_dir.to_path_buf(),
+            db_path: snapshot.db_path.unwrap_or_else(|| db_path.to_path_buf()),
+            job_id: snapshot.job_id,
+            job_kind: snapshot.job_kind,
+            phase: snapshot.phase,
+        })
+    }
+
+    fn without_owner(data_dir: &Path, db_path: &Path) -> Self {
+        Self {
+            pid: None,
+            started_at_ms: None,
+            data_dir: data_dir.to_path_buf(),
+            db_path: db_path.to_path_buf(),
+            job_id: None,
+            job_kind: None,
+            phase: None,
+        }
+    }
+
+    fn started_at_rfc3339(&self) -> Option<String> {
+        self.started_at_ms.and_then(format_timestamp_millis_rfc3339)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "data_dir": self.data_dir.display().to_string(),
+            "db_path": self.db_path.display().to_string(),
+            "pid": self.pid,
+            "started_at": self.started_at_rfc3339(),
+            "job_id": self.job_id,
+            "job_kind": self.job_kind.map(|kind| kind.as_lock_value()),
+            "phase": self.phase,
+        })
+    }
+
+    fn to_cli_error(&self) -> CliError {
+        let mut details = Vec::new();
+        if let Some(pid) = self.pid {
+            details.push(format!("pid {pid}"));
+        }
+        if let Some(job_id) = &self.job_id {
+            details.push(format!("job {job_id}"));
+        }
+        if let Some(job_kind) = self.job_kind {
+            details.push(format!("kind {}", job_kind.as_lock_value()));
+        }
+        if let Some(phase) = &self.phase {
+            details.push(format!("phase {phase}"));
+        }
+        if let Some(started_at) = self.started_at_rfc3339() {
+            details.push(format!("started {started_at}"));
+        }
+        details.push(format!("db {}", self.db_path.display()));
+
+        let mut message = format!(
+            "another 'cass index' run is already active for data dir {}",
+            self.data_dir.display()
+        );
+        if !details.is_empty() {
+            message.push_str(&format!(" ({})", details.join(", ")));
+        }
+
+        CliError {
+            code: 7,
+            kind: "index_busy",
+            message,
+            hint: Some(
+                "Wait for the active run to finish or point --data-dir/--db at a different cass dataset."
+                    .to_string(),
+            ),
+            retryable: true,
+        }
+    }
+}
+
+fn format_timestamp_millis_rfc3339(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+}
+
+fn read_index_run_lock_snapshot(
+    data_dir: &Path,
+) -> crate::search::asset_state::SearchMaintenanceSnapshot {
+    crate::search::asset_state::read_search_maintenance_snapshot(data_dir)
+}
+
+fn probe_index_run_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> crate::search::asset_state::SearchMaintenanceSnapshot {
+    let snapshot = read_index_run_lock_snapshot(data_dir);
+    if snapshot.db_path.as_deref() != Some(db_path) {
+        return crate::search::asset_state::SearchMaintenanceSnapshot::default();
+    }
+    snapshot
+}
+
+fn active_index_run_details(data_dir: &Path, db_path: &Path) -> Option<ActiveIndexRunDetails> {
+    ActiveIndexRunDetails::from_snapshot(data_dir, db_path, read_index_run_lock_snapshot(data_dir))
+}
+
+fn error_chain_indicates_active_cass_index(chain: &str) -> bool {
+    chain.contains("another cass index process already holds")
+}
+
+fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "success": false,
+        "error": err.message,
+        "elapsed_ms": elapsed_ms,
+        "code": err.code,
+        "kind": err.kind,
+        "retryable": err.retryable,
+    });
+    if let Some(hint) = &err.hint {
+        payload["hint"] = serde_json::json!(hint);
+    }
+    payload
+}
+
 fn state_meta_json(
     data_dir: &Path,
     db_path: &Path,
@@ -4132,53 +5186,34 @@ fn state_meta_json(
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Use the actual versioned index path (index/v4, not tantivy_index)
-    let index_path = crate::search::tantivy::index_dir(data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
-    let index_exists = index_path.exists();
     let db_exists = db_path.exists();
-    let watch_state_path = data_dir.join("watch_state.json");
+    let index_run = probe_index_run_lock(data_dir, db_path);
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut conversation_count: i64 = 0;
-    let mut message_count: i64 = 0;
-    let mut last_indexed_at: Option<i64> = None;
-    let mut db_opened = false;
+    let db_size_bytes = fs::metadata(db_path).map(|m| m.len()).ok();
+    let include_counts = db_size_bytes
+        .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
+        .unwrap_or(false);
+    let db_snapshot = if allow_db_open && db_exists {
+        probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
+    } else {
+        StateDbSnapshot::default()
+    };
+    let conversation_count = db_snapshot.conversation_count;
+    let message_count = db_snapshot.message_count;
+    let mut last_indexed_at = db_snapshot.last_indexed_at;
+    let db_opened = db_snapshot.opened;
+    let db_open_error = db_snapshot.open_error;
+    let db_open_retryable = db_snapshot.open_retryable;
+    let counts_skipped = db_snapshot.counts_skipped;
 
-    // Use LazyFrankenDb to get timing/logging for state snapshot DB access
-    let lazy = crate::storage::sqlite::LazyFrankenDb::new(db_path.to_path_buf());
-    if allow_db_open
-        && db_exists
-        && let Ok(conn) = lazy.get("state-meta")
-    {
-        use frankensqlite::compat::{ConnectionExt, RowExt};
-        use frankensqlite::params;
-        db_opened = true;
-        conversation_count = conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        message_count = conn
-            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        last_indexed_at = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                params![],
-                |r| r.get_typed::<String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
-    }
-
-    if last_indexed_at.is_none() && index_exists {
+    let index_path = crate::search::tantivy::index_dir(data_dir)
+        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
+    if last_indexed_at.is_none() && index_path.exists() {
         let meta_path = index_path.join("meta.json");
         let probe_path = if meta_path.exists() {
             meta_path
@@ -4191,26 +5226,93 @@ fn state_meta_json(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
-
-    let pending_sessions = if watch_state_path.exists() {
-        std::fs::read_to_string(&watch_state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|v| v.get("pending_count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000;
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
+    let assets = crate::search::asset_state::inspect_search_assets(
+        crate::search::asset_state::InspectSearchAssetsInput {
+            data_dir,
+            db_path,
+            stale_threshold,
+            last_indexed_at_ms: last_indexed_at,
+            now_secs,
+            maintenance: index_run.clone(),
+            semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
+            db_available: db_opened,
+        },
+    )
+    .unwrap_or_else(|err| {
+        let summary = err.to_string();
+        crate::search::asset_state::SearchAssetSnapshot {
+            lexical: crate::search::asset_state::LexicalAssetState {
+                status: "error",
+                exists: index_path.exists(),
+                fresh: false,
+                stale: true,
+                rebuilding: index_run
+                    .mode
+                    .is_some_and(crate::search::asset_state::SearchMaintenanceMode::rebuild_active)
+                    && index_run.active,
+                watch_active: index_run
+                    .mode
+                    .is_some_and(crate::search::asset_state::SearchMaintenanceMode::watch_active)
+                    && index_run.active,
+                last_indexed_at_ms: last_indexed_at,
+                age_seconds: last_indexed_at
+                    .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64))),
+                stale_threshold_seconds: stale_threshold,
+                activity_at_ms: index_run.updated_at_ms.or(index_run.started_at_ms),
+                pending_sessions: 0,
+                processed_conversations: None,
+                total_conversations: None,
+                indexed_docs: None,
+                status_reason: Some(format!("asset inspection failed: {summary}")),
+                fingerprint: crate::search::asset_state::LexicalFingerprintState {
+                    current_db_fingerprint: None,
+                    checkpoint_fingerprint: None,
+                    matches_current_db_fingerprint: None,
+                },
+                checkpoint: crate::search::asset_state::LexicalCheckpointState {
+                    present: false,
+                    completed: None,
+                    db_matches: None,
+                    schema_matches: None,
+                    page_size_matches: None,
+                },
+            },
+            semantic: crate::search::asset_state::SemanticAssetState {
+                status: "error",
+                availability: "load_failed",
+                summary: format!("asset inspection failed: {summary}"),
+                available: false,
+                can_search: false,
+                fallback_mode: Some("lexical"),
+                preferred_backend: "fastembed",
+                embedder_id: None,
+                vector_index_path: None,
+                model_dir: None,
+                hnsw_path: None,
+                hnsw_ready: false,
+                progressive_ready: false,
+                hint: Some("Use --mode lexical until semantic assets are repaired".to_string()),
+            },
+        }
     });
-    let is_stale = match index_age_secs {
-        None => true,
-        Some(age) => age > stale_threshold,
+    let lexical = &assets.lexical;
+    let semantic = &assets.semantic;
+
+    // Probe Tantivy index document count when the DB has messages.
+    // This is cheap (one reader open) and only runs when it matters.
+    let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
+        frankensearch::lexical::cass_open_search_reader(
+            &index_path,
+            frankensearch::lexical::ReloadPolicy::Manual,
+        )
+        .ok()
+        .map(|(reader, _fields)| reader.searcher().num_docs())
+    } else {
+        None
     };
-    let fresh = index_exists && !is_stale;
+    let index_empty_with_messages = index_doc_count
+        .map(|docs| docs == 0 && message_count > 0)
+        .unwrap_or(false);
 
     let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -4218,26 +5320,90 @@ fn state_meta_json(
 
     serde_json::json!({
         "index": {
-            "exists": index_exists,
-            "fresh": fresh,
+            "exists": lexical.exists,
+            "status": lexical.status,
+            "reason": lexical.status_reason,
+            "fresh": lexical.fresh,
             "last_indexed_at": last_indexed_at.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
                     .to_rfc3339()
             }),
-            "age_seconds": index_age_secs,
-            "stale": is_stale,
-            "stale_threshold_seconds": stale_threshold
+            "age_seconds": lexical.age_seconds,
+            "stale": lexical.stale,
+            "stale_threshold_seconds": stale_threshold,
+            "rebuilding": lexical.rebuilding,
+            "activity_at": lexical.activity_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "documents": index_doc_count,
+            "empty_with_messages": index_empty_with_messages,
+            "fingerprint": {
+                "current_db_fingerprint": lexical.fingerprint.current_db_fingerprint,
+                "checkpoint_fingerprint": lexical.fingerprint.checkpoint_fingerprint,
+                "matches_current_db_fingerprint": lexical.fingerprint.matches_current_db_fingerprint,
+            },
+            "checkpoint": {
+                "present": lexical.checkpoint.present,
+                "completed": lexical.checkpoint.completed,
+                "db_matches": lexical.checkpoint.db_matches,
+                "schema_matches": lexical.checkpoint.schema_matches,
+                "page_size_matches": lexical.checkpoint.page_size_matches,
+            }
         },
         "database": {
             "exists": db_exists,
             "opened": db_opened,
-            "conversations": conversation_count,
-            "messages": message_count
+            "conversations": state_db_count_json(conversation_count, counts_skipped),
+            "messages": state_db_count_json(message_count, counts_skipped),
+            "open_error": db_open_error,
+            "open_retryable": db_open_retryable,
+            "counts_skipped": counts_skipped
         },
         "pending": {
-            "sessions": pending_sessions,
-            "watch_active": watch_state_path.exists()
+            "sessions": lexical.pending_sessions,
+            "watch_active": lexical.watch_active,
+            "orphaned": index_run.orphaned
+        },
+        "rebuild": {
+            "active": lexical.rebuilding,
+            "orphaned": index_run.orphaned,
+            "pid": index_run.pid,
+            "mode": index_run.mode.map(|mode| mode.as_lock_value()),
+            "job_id": index_run.job_id,
+            "job_kind": index_run.job_kind.map(|kind| kind.as_lock_value()),
+            "phase": index_run.phase,
+            "started_at": index_run.started_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "updated_at": lexical.activity_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "processed_conversations": lexical.processed_conversations,
+            "total_conversations": lexical.total_conversations,
+            "indexed_docs": lexical.indexed_docs
+        },
+        "semantic": {
+            "status": semantic.status,
+            "availability": semantic.availability,
+            "summary": semantic.summary,
+            "available": semantic.available,
+            "can_search": semantic.can_search,
+            "fallback_mode": semantic.fallback_mode,
+            "preferred_backend": semantic.preferred_backend,
+            "embedder_id": semantic.embedder_id,
+            "vector_index_path": semantic.vector_index_path.as_ref().map(|path| path.display().to_string()),
+            "model_dir": semantic.model_dir.as_ref().map(|path| path.display().to_string()),
+            "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
+            "hnsw_ready": semantic.hnsw_ready,
+            "progressive_ready": semantic.progressive_ready,
+            "hint": semantic.hint,
         },
         "_meta": {
             "timestamp": ts_str,
@@ -4252,13 +5418,98 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
     let pending = state.get("pending");
     Some(serde_json::json!({
         "exists": index.get("exists"),
+        "status": index.get("status"),
+        "reason": index.get("reason"),
         "fresh": index.get("fresh"),
         "last_indexed_at": index.get("last_indexed_at"),
         "age_seconds": index.get("age_seconds"),
         "stale": index.get("stale"),
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
+        "rebuilding": index.get("rebuilding"),
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
+}
+fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
+    if counts_skipped {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(count)
+    }
+}
+
+fn refresh_state_database_counts_if_needed(
+    state: &mut serde_json::Value,
+    db_path: &Path,
+    reason: &str,
+) {
+    let current_opened = state
+        .get("database")
+        .and_then(|db| db.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let current_counts_skipped = state
+        .get("database")
+        .and_then(|db| db.get("counts_skipped"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let current_conversations = state
+        .get("database")
+        .and_then(|db| db.get("conversations"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let current_messages = state
+        .get("database")
+        .and_then(|db| db.get("messages"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let needs_refresh = current_counts_skipped
+        || !current_opened
+        || current_conversations <= 0
+        || current_messages <= 0;
+    if !needs_refresh || !db_path.exists() {
+        return;
+    }
+
+    let refreshed = probe_state_db(db_path, reason, Duration::from_secs(30), true);
+    let improved = (!current_opened && refreshed.opened)
+        || (current_counts_skipped && !refreshed.counts_skipped)
+        || (current_conversations <= 0 && refreshed.conversation_count > 0)
+        || (current_messages <= 0 && refreshed.message_count > 0);
+    if !improved {
+        return;
+    }
+
+    let Some(database) = state.get_mut("database").and_then(|db| db.as_object_mut()) else {
+        return;
+    };
+    database.insert(
+        "opened".to_string(),
+        serde_json::Value::Bool(refreshed.opened),
+    );
+    database.insert(
+        "conversations".to_string(),
+        state_db_count_json(refreshed.conversation_count, refreshed.counts_skipped),
+    );
+    database.insert(
+        "messages".to_string(),
+        state_db_count_json(refreshed.message_count, refreshed.counts_skipped),
+    );
+    database.insert(
+        "open_error".to_string(),
+        refreshed
+            .open_error
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    database.insert(
+        "open_retryable".to_string(),
+        serde_json::Value::Bool(refreshed.open_retryable),
+    );
+    database.insert(
+        "counts_skipped".to_string(),
+        serde_json::Value::Bool(refreshed.counts_skipped),
+    );
 }
 
 fn warn_tui_terminal_profile(stderr_is_tty: bool) {
@@ -4334,13 +5585,13 @@ fn prepare_headless_once_tui_artifacts(
     })?;
 
     if let Some(path) = asciicast_path {
-        write_headless_asciicast_stub(path)?;
+        write_headless_asciicast_sentinel(path)?;
     }
 
     Ok(())
 }
 
-fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
+fn write_headless_asciicast_sentinel(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -4360,6 +5611,9 @@ fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
         "width": 120,
         "height": 40,
         "timestamp": Utc::now().timestamp(),
+        "cass_artifact_kind": "headless_once_asciicast_sentinel",
+        "recording_available": false,
+        "reason": "non_interactive_headless_once_bootstrap",
         "env": {
             "TERM": dotenvy::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
             "SHELL": dotenvy::var("SHELL").unwrap_or_else(|_| "cass".to_string())
@@ -4368,9 +5622,61 @@ fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
 
     writeln!(file, "{header}")
         .map_err(|e| anyhow::anyhow!("write asciicast header to {}: {e}", path.display()))?;
-    writeln!(file, "[0.0,\"o\",\"\"]")
+    let sentinel_frame = serde_json::to_string(
+        "cass headless --once bootstrap completed without launching the interactive TUI.\r\n\
+This asciicast is a sentinel artifact, not a real terminal session recording.\r\n",
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "encode asciicast sentinel frame for {}: {e}",
+            path.display()
+        )
+    })?;
+    writeln!(file, "[0.0,\"o\",{sentinel_frame}]")
         .map_err(|e| anyhow::anyhow!("write asciicast frame to {}: {e}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod headless_asciicast_sentinel_tests {
+    use super::write_headless_asciicast_sentinel;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn headless_asciicast_sentinel_is_labeled_and_nonempty() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cast_path = tmp.path().join("captures").join("headless.cast");
+
+        write_headless_asciicast_sentinel(&cast_path).expect("write sentinel cast");
+
+        let cast = fs::read_to_string(&cast_path).expect("read sentinel cast");
+        assert!(cast.contains("\"version\":2"));
+        assert!(cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""));
+        assert!(cast.contains("\"recording_available\":false"));
+        assert!(cast.contains("sentinel artifact, not a real terminal session recording"));
+        assert!(
+            !cast.contains("[0.0,\"o\",\"\"]"),
+            "sentinel cast must not use an empty placeholder frame"
+        );
+    }
+
+    #[test]
+    fn headless_asciicast_sentinel_overwrites_existing_stub_content() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cast_path = tmp.path().join("existing.cast");
+        fs::write(&cast_path, "{\"version\":2}\n[0.0,\"o\",\"\"]\n").expect("write old stub");
+
+        write_headless_asciicast_sentinel(&cast_path).expect("rewrite sentinel cast");
+
+        let cast = fs::read_to_string(&cast_path).expect("read overwritten cast");
+        assert!(cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""));
+        assert!(cast.contains("headless --once bootstrap completed"));
+        assert!(
+            !cast.contains("[0.0,\"o\",\"\"]"),
+            "overwritten cast should no longer contain the vacuous stub frame"
+        );
+    }
 }
 
 fn configure_color(choice: ColorPref, stdout_is_tty: bool, stderr_is_tty: bool) {
@@ -4397,37 +5703,6 @@ fn resolve_progress(mode: ProgressMode, stdout_is_tty: bool) -> ProgressResolved
     }
 }
 
-/// Convert [`LazyDbError`] to the CLI-appropriate [`CliError`].
-fn lazy_db_to_cli_error(e: crate::storage::sqlite::LazyDbError) -> CliError {
-    use crate::storage::sqlite::LazyDbError;
-    match e {
-        LazyDbError::NotFound(path) => CliError {
-            code: 3,
-            kind: "missing-db",
-            message: format!(
-                "Database not found at {}. Run 'cass index --full' first.",
-                path.display()
-            ),
-            hint: Some("Run 'cass index --full' to create the database.".into()),
-            retryable: true,
-        },
-        LazyDbError::OpenFailed { path, source } => CliError {
-            code: 9,
-            kind: "db-open",
-            message: format!("Failed to open database at {}: {source}", path.display()),
-            hint: None,
-            retryable: false,
-        },
-        LazyDbError::FrankenOpenFailed { path, source } => CliError {
-            code: 9,
-            kind: "db-open",
-            message: format!("Failed to open database at {}: {source}", path.display()),
-            hint: None,
-            retryable: false,
-        },
-    }
-}
-
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
@@ -4447,6 +5722,8 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Health { .. }) => "health".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
+        Some(Commands::Sessions { .. }) => "sessions".to_string(),
+        Some(Commands::Resume { .. }) => "resume".to_string(),
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
@@ -4454,63 +5731,99 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
+        #[cfg(unix)]
+        Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
     }
 }
 
+fn resolve_subcommand_structured_format(cli: &Cli, json: bool) -> Option<RobotFormat> {
+    cli.robot_format
+        .or(if json { Some(RobotFormat::Json) } else { None })
+        .or_else(robot_format_from_env)
+}
+
+fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bool {
+    let json = match cmd {
+        AnalyticsCommand::Status { common }
+        | AnalyticsCommand::Tokens { common, .. }
+        | AnalyticsCommand::Tools { common, .. }
+        | AnalyticsCommand::AnalyticsModels { common, .. }
+        | AnalyticsCommand::Rebuild { common, .. }
+        | AnalyticsCommand::Validate { common, .. } => common.json,
+    };
+
+    resolve_subcommand_structured_format(cli, json).is_some()
+}
+
 /// Returns true if the command is using robot/JSON output mode.
 /// Used to auto-suppress INFO logs for clean machine-parseable output.
-fn is_robot_mode(command: &Commands) -> bool {
+fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
     // Env-driven output formats should behave like robot mode (suppresses INFO logs).
     let env_robot_mode = robot_format_from_env().is_some();
 
     match command {
         Commands::Search {
-            json,
-            robot_format,
-            robot_meta,
-            ..
-        } => *json || robot_format.is_some() || *robot_meta || env_robot_mode,
-        Commands::Index { json, .. } => *json || env_robot_mode,
-        Commands::Stats { json, .. } => *json || env_robot_mode,
-        Commands::Diag { json, .. } => *json || env_robot_mode,
-        Commands::Status { json, .. } => *json || env_robot_mode,
-        Commands::Health { json, .. } => *json || env_robot_mode,
-        Commands::Doctor { json, .. } => *json || env_robot_mode,
-        Commands::ApiVersion { json, .. } => *json || env_robot_mode,
-        Commands::State { json, .. } => *json || env_robot_mode,
-        Commands::View { json, .. } => *json || env_robot_mode,
-        Commands::Capabilities { json, .. } => *json || env_robot_mode,
-        Commands::Introspect { json, .. } => *json || env_robot_mode,
-        Commands::Context { json, .. } => *json || env_robot_mode,
-        Commands::Expand { json, .. } => *json || env_robot_mode,
-        Commands::ExportHtml { json, .. } => *json || env_robot_mode,
-        Commands::Timeline { json, .. } => *json || env_robot_mode,
-        Commands::Sources(cmd) => match cmd {
-            // Only `sources list` honors env-based structured output today.
-            SourcesCommand::List { json, .. } => *json || env_robot_mode,
-            SourcesCommand::Doctor { json, .. }
-            | SourcesCommand::Sync { json, .. }
-            | SourcesCommand::Discover { json, .. }
-            | SourcesCommand::Setup { json, .. } => *json,
-            _ => false,
-        },
-        Commands::Import(cmd) => match cmd {
-            ImportCommand::Chatgpt { json, .. } => *json || env_robot_mode,
-        },
-        Commands::Analytics(cmd) => {
-            let json = match cmd {
-                AnalyticsCommand::Status { common, .. }
-                | AnalyticsCommand::Tokens { common, .. }
-                | AnalyticsCommand::Tools { common, .. }
-                | AnalyticsCommand::AnalyticsModels { common, .. }
-                | AnalyticsCommand::Rebuild { common, .. }
-                | AnalyticsCommand::Validate { common, .. } => common.json,
-            };
-            json || env_robot_mode
+            json, robot_meta, ..
+        } => resolve_subcommand_structured_format(cli, *json).is_some() || *robot_meta,
+        Commands::Index { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Sessions { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Resume { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::ExportHtml { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Stats { json, .. }
+        | Commands::Diag { json, .. }
+        | Commands::Status { json, .. }
+        | Commands::ApiVersion { json }
+        | Commands::State { json, .. }
+        | Commands::View { json, .. }
+        | Commands::Capabilities { json }
+        | Commands::Introspect { json }
+        | Commands::Context { json, .. }
+        | Commands::Expand { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Timeline { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::List { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Doctor { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Sync { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Discover { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Setup { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Models(ModelsCommand::Status { json }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Models(ModelsCommand::Verify { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(_) => false,
+        Commands::Import(cmd) => match cmd {
+            ImportCommand::Chatgpt { .. } => cli.robot_format.is_some() || env_robot_mode,
+        },
+        Commands::Models(_) => cli.robot_format.is_some() || env_robot_mode,
+        Commands::Analytics(cmd) => analytics_requests_structured_output(cmd, cli),
         _ => false,
     }
 }
@@ -4670,7 +5983,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
                     chars.next();
                     break;
                 }
-                phrase.push(chars.next().unwrap());
+                if let Some(n) = chars.next() {
+                    phrase.push(n);
+                }
             }
             if !phrase.is_empty() {
                 terms.push(phrase);
@@ -4680,7 +5995,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
             let mut word = String::from(c);
             while let Some(&next) = chars.peek() {
                 if next.is_alphanumeric() || next == '_' || next == '-' {
-                    word.push(chars.next().unwrap());
+                    if let Some(n) = chars.next() {
+                        word.push(n);
+                    }
                 } else if next == ':' {
                     // This is a field filter - skip the whole thing
                     chars.next(); // consume ':'
@@ -4726,6 +6043,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"bug fix\" --today        # Search today's sessions only",
         "  cass search \"api\" --week --agent codex  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
+        "  cass sessions --current --json       # Find current workspace session",
         "  cass view /path/file.jsonl -n 42    # View file at line 42",
         "  cass robot-docs commands            # Machine-readable command list",
         "  cass --robot-docs=commands          # Also accepted (auto-normalized)",
@@ -4744,7 +6062,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
-        "Subcommands: search | stats | view | index | tui | robot-docs <topic>",
+        "Subcommands: search | sessions | stats | view | index | tui | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 2 usage; 3 missing index/db; 9 unknown",
         "More: cass robot-docs examples | cass robot-docs commands",
@@ -4768,7 +6086,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
             "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
-            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
+            "                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -4782,6 +6100,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
+            "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
@@ -4847,6 +6166,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "# Filter by agent or workspace".to_string(),
             "  cass search \"error\" --agent codex         # codex sessions only".to_string(),
             "  cass search \"test\" --workspace /myproject # specific project".to_string(),
+            String::new(),
+            "# Discover session files for follow-up actions".to_string(),
+            "  cass sessions --current --json             # best match for current cwd".to_string(),
+            "  cass sessions --workspace /myproject --json --limit 5".to_string(),
             String::new(),
             "# Follow up on search results".to_string(),
             "  cass view /path/to/session.jsonl -n 42   # view line 42 with context".to_string(),
@@ -5025,7 +6348,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.buckets: [{ bucket: string, counts: {...}, content_tokens: {...},".into(),
         "                   api_tokens: {...}, plan: {...}, derived: {...} }]".into(),
         "  data.totals: <same shape as bucket>".into(),
-        "  data.source_table: string  ('usage_daily' | 'usage_hourly')".into(),
+        "  data.source_table: string  ('usage_daily' | 'usage_hourly' | 'messages' | 'message_metrics')".into(),
         "  data.granularity: string   ('hour' | 'day' | 'week' | 'month')".into(),
         "  Bucket keys: counts.{message_count, user_message_count, assistant_message_count,".into(),
         "    tool_call_count, plan_message_count}; api_tokens.{total, input, output,".into(),
@@ -5038,13 +6361,16 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.totals: { tool_call_count, message_count, api_tokens_total,".into(),
         "                 overall_per_1k_api_tokens }".into(),
         "  data.row_count: int".into(),
+        "  data._meta.source_table: (\'usage_daily\' | \'usage_hourly\' | \'message_metrics\')".into(),
         "  --limit N (default 20): caps returned rows".into(),
         String::new(),
         "### analytics models".into(),
         "  data.by_api_tokens: { dim, metric, rows: [{ key, value, message_count, ... }] }".into(),
         "  data.timeseries: <same as analytics tokens>".into(),
-        "  Source: token_daily_stats (Track B) — models only available for connectors".into(),
-        "    that report model names (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
+        "  data.by_api_tokens._meta.source_table: string  ('token_daily_stats' | 'token_usage')".into(),
+        "    Usually token_daily_stats; token_usage when filters require raw provenance recovery.".into(),
+        "  Models only available for connectors that report model names".into(),
+        "    (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
         String::new(),
         "### analytics rebuild".into(),
         "  data.track: string ('a')".into(),
@@ -5062,9 +6388,9 @@ fn render_analytics_docs() -> Vec<String> {
         "      track_b.{tokens,agents}_match, cross_track.drift, non_negative.counters".into(),
         "  data.drift: [{ day_id, agent_slug, source_id, track_a_total,".into(),
         "                 track_b_total, delta, delta_pct, likely_cause }]".into(),
-        "  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget },".into(),
-        "              breakdown: { elapsed_ms, budget_ms, within_budget } }".into(),
-        "  --fix: attempt automatic repair (not yet implemented)".into(),
+        "  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget, error?, details },".into(),
+        "              breakdown: { elapsed_ms, budget_ms, within_budget, error?, details } }".into(),
+        "  --fix: run deep validation, rebuild safe Track A rollups when possible, and report skipped non-fixable issues".into(),
         String::new(),
         "## Coverage & Uncertainty Semantics".into(),
         "  - api_token_coverage_pct: % of messages with API token data (from Claude, Codex).".into(),
@@ -5082,7 +6408,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  exit 9 + retryable=true: transient DB lock/busy — retry after 1s".into(),
         "  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first".into(),
         "  exit 3: no database — run 'cass index --full' to create it".into(),
-        "  validate errors: run 'cass analytics rebuild --force' then re-validate".into(),
+        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop".into(),
         String::new(),
         "## Common Workflows".into(),
         "  # Quick health check".into(),
@@ -5452,6 +6778,15 @@ fn run_cli_search(
         retryable: true,
     })?;
 
+    if !client.has_tantivy() {
+        eprintln!(
+            "Warning: Tantivy search index not found at {}. \
+             Results will be severely limited. \
+             Run `cass index --full` to rebuild the index.",
+            index_path.display()
+        );
+    }
+
     // Determine effective search mode (default to Lexical)
     let effective_mode = mode.unwrap_or(SearchMode::Lexical);
     let approximate = if semantic_opts.approximate && matches!(effective_mode, SearchMode::Lexical)
@@ -5508,13 +6843,28 @@ fn run_cli_search(
             let roles = context.roles;
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
-                use crate::search::daemon_client::{
-                    DaemonFallbackEmbedder, DaemonRetryConfig, NoopDaemonClient,
-                };
+                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
 
-                let daemon = Arc::new(NoopDaemonClient::new("daemon-unconfigured"));
-                let config = DaemonRetryConfig::from_env();
-                Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                #[cfg(unix)]
+                {
+                    let daemon = crate::daemon::client::try_connect()
+                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                        .unwrap_or_else(|| {
+                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                "daemon-unconfigured",
+                            ))
+                        });
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
+                #[cfg(not(unix))]
+                {
+                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                        "daemon-unconfigured",
+                    ));
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
             } else {
                 embedder
             };
@@ -5784,6 +7134,7 @@ fn run_cli_search(
                 cache_stats: crate::search::query::CacheStats::default(),
                 suggestions: Vec::new(),
                 ann_stats,
+                total_count: None,
             }
         }
         SearchMode::Hybrid => client
@@ -5826,9 +7177,6 @@ fn run_cli_search(
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::daemon_client::{
-            DaemonFallbackReranker, DaemonRetryConfig, NoopDaemonClient,
-        };
         use crate::search::fastembed_reranker::FastEmbedReranker;
         use crate::search::reranker::{Reranker, rerank_texts};
 
@@ -5845,13 +7193,36 @@ fn run_cli_search(
             };
 
         let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            let daemon = Arc::new(NoopDaemonClient::new("daemon-unconfigured"));
-            let config = DaemonRetryConfig::from_env();
-            Some(Arc::new(DaemonFallbackReranker::new(
-                daemon,
-                local_reranker,
-                config,
-            )))
+            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
+
+            #[cfg(unix)]
+            {
+                let daemon = crate::daemon::client::try_connect()
+                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "daemon-unconfigured",
+                        ))
+                    });
+                let config = DaemonRetryConfig::from_env();
+                Some(Arc::new(DaemonFallbackReranker::new(
+                    daemon,
+                    local_reranker,
+                    config,
+                )))
+            }
+            #[cfg(not(unix))]
+            {
+                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                    "daemon-unconfigured",
+                ));
+                let config = DaemonRetryConfig::from_env();
+                Some(Arc::new(DaemonFallbackReranker::new(
+                    daemon,
+                    local_reranker,
+                    config,
+                )))
+            }
         } else {
             local_reranker
         };
@@ -5908,6 +7279,7 @@ fn run_cli_search(
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
                             ann_stats: result.ann_stats,
+                            total_count: result.total_count,
                         }
                     }
                     Err(e) => {
@@ -5972,6 +7344,7 @@ fn run_cli_search(
             cache_stats: result.cache_stats,
             suggestions: result.suggestions.clone(),
             ann_stats: result.ann_stats.clone(),
+            total_count: result.total_count,
         };
         let has_more = total > offset_val + display.hits.len();
         (aggs, display, total, has_more)
@@ -5985,15 +7358,20 @@ fn run_cli_search(
             limit_val
         };
         let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
-        let known_total = offset_val
-            .saturating_add(display_hits.len())
-            .saturating_add(usize::from(has_more));
+        // Use the true total from Tantivy's Count collector when available;
+        // fall back to the page-window lower bound for semantic/hybrid/cached paths.
+        let known_total = result.total_count.unwrap_or_else(|| {
+            offset_val
+                .saturating_add(display_hits.len())
+                .saturating_add(usize::from(has_more))
+        });
         let display = crate::search::query::SearchResult {
             hits: display_hits,
             wildcard_fallback: result.wildcard_fallback,
             cache_stats: result.cache_stats,
             suggestions: result.suggestions,
             ann_stats: result.ann_stats,
+            total_count: result.total_count,
         };
         (Aggregations::default(), display, known_total, has_more)
     };
@@ -6293,12 +7671,58 @@ fn resolve_field_mask(
 }
 
 /// Filter a search hit to only include the requested fields
+fn safe_robot_score_value(score: f32) -> serde_json::Value {
+    serde_json::Value::from(if score.is_finite() { score as f64 } else { 0.0 })
+}
+
+fn normalized_robot_hit_source_id(hit: &crate::search::query::SearchHit) -> String {
+    if let Some(source_id) = canonical_followup_source_id(Some(hit.source_id.as_str())) {
+        return source_id;
+    }
+    if hit.origin_kind.trim().eq_ignore_ascii_case("local") {
+        return crate::sources::provenance::LOCAL_SOURCE_ID.to_string();
+    }
+    hit.source_id.trim().to_string()
+}
+
+fn normalized_robot_hit_origin_kind(hit: &crate::search::query::SearchHit) -> String {
+    let trimmed = hit.origin_kind.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if normalized_robot_hit_source_id(hit) == crate::sources::provenance::LOCAL_SOURCE_ID {
+        return crate::sources::provenance::LOCAL_SOURCE_ID.to_string();
+    }
+    String::new()
+}
+
+fn normalized_robot_hit_origin_host(hit: &crate::search::query::SearchHit) -> Option<String> {
+    hit.origin_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_robot_hit_for_output(
+    hit: &crate::search::query::SearchHit,
+) -> crate::search::query::SearchHit {
+    let mut normalized = hit.clone();
+    normalized.source_id = normalized_robot_hit_source_id(hit);
+    normalized.origin_kind = normalized_robot_hit_origin_kind(hit);
+    normalized.origin_host = normalized_robot_hit_origin_host(hit);
+    if !normalized.score.is_finite() {
+        normalized.score = 0.0;
+    }
+    normalized
+}
+
 fn projected_hit_field_value(
     hit: &crate::search::query::SearchHit,
     field: &str,
 ) -> Option<serde_json::Value> {
     match field {
-        "score" => serde_json::to_value(hit.score).ok(),
+        "score" => Some(safe_robot_score_value(hit.score)),
         "agent" => Some(serde_json::Value::String(hit.agent.clone())),
         "workspace" => Some(serde_json::Value::String(hit.workspace.clone())),
         "source_path" => Some(serde_json::Value::String(hit.source_path.clone())),
@@ -6309,14 +7733,15 @@ fn projected_hit_field_value(
         "line_number" => serde_json::to_value(hit.line_number).ok(),
         "match_type" => serde_json::to_value(hit.match_type).ok(),
         // Provenance fields (P3.4)
-        "source_id" => Some(serde_json::Value::String(hit.source_id.clone())),
-        "origin_kind" => Some(serde_json::Value::String(hit.origin_kind.clone())),
+        "source_id" => Some(serde_json::Value::String(normalized_robot_hit_source_id(
+            hit,
+        ))),
+        "origin_kind" => Some(serde_json::Value::String(normalized_robot_hit_origin_kind(
+            hit,
+        ))),
         // Preserve SearchHit serialization semantics:
         // origin_host/workspace_original are omitted entirely when None.
-        "origin_host" => hit
-            .origin_host
-            .as_ref()
-            .map(|value| serde_json::Value::String(value.clone())),
+        "origin_host" => normalized_robot_hit_origin_host(hit).map(serde_json::Value::String),
         "workspace_original" => hit
             .workspace_original
             .as_ref()
@@ -6329,9 +7754,13 @@ fn filter_hit_fields(
     hit: &crate::search::query::SearchHit,
     fields: &Option<Vec<String>>,
 ) -> serde_json::Value {
+    // Sanitize NaN/Infinity score before serialization — serde_json rejects non-finite floats.
+    let sanitize = |h: &crate::search::query::SearchHit| -> serde_json::Value {
+        serde_json::to_value(normalized_robot_hit_for_output(h)).unwrap_or_default()
+    };
     match fields {
-        None => serde_json::to_value(hit).unwrap_or_default(), // No filtering
-        Some(field_list) if field_list.is_empty() => serde_json::to_value(hit).unwrap_or_default(), // "all" or "*" preset
+        None => sanitize(hit),
+        Some(field_list) if field_list.is_empty() => sanitize(hit),
         Some(field_list) => {
             let mut filtered = serde_json::Map::new();
             let known_fields = [
@@ -6349,6 +7778,7 @@ fn filter_hit_fields(
                 "source_id",
                 "origin_kind",
                 "origin_host",
+                "workspace_original",
             ];
 
             for field in field_list {
@@ -6633,8 +8063,8 @@ fn output_robot_results(
                 map.serialize_entry("line_number", &hit.line_number)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("title", &hit.title)?;
-                // Preserve existing score rendering behavior from serde_json::Value path.
-                map.serialize_entry("score", &(hit.score as f64))?;
+                let safe_score = safe_robot_score_value(hit.score);
+                map.serialize_entry("score", &safe_score)?;
                 map.end()
             }
         }
@@ -6731,18 +8161,21 @@ fn output_robot_results(
                 S: Serializer,
             {
                 let hit = self.0;
+                let normalized_source_id = normalized_robot_hit_source_id(hit);
+                let normalized_origin_host = normalized_robot_hit_origin_host(hit);
                 let mut fields = 12usize;
                 if hit.workspace_original.is_some() {
                     fields += 1;
                 }
-                if hit.origin_host.is_some() {
+                if normalized_origin_host.is_some() {
                     fields += 1;
                 }
                 let mut map = serializer.serialize_map(Some(fields))?;
                 map.serialize_entry("title", &hit.title)?;
                 map.serialize_entry("snippet", &hit.snippet)?;
                 map.serialize_entry("content", &hit.content)?;
-                map.serialize_entry("score", &(hit.score as f64))?;
+                let safe_score = safe_robot_score_value(hit.score);
+                map.serialize_entry("score", &safe_score)?;
                 map.serialize_entry("source_path", &hit.source_path)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("workspace", &hit.workspace)?;
@@ -6752,9 +8185,10 @@ fn output_robot_results(
                 map.serialize_entry("created_at", &hit.created_at)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
                 map.serialize_entry("match_type", &hit.match_type)?;
-                map.serialize_entry("source_id", &hit.source_id)?;
-                map.serialize_entry("origin_kind", &hit.origin_kind)?;
-                if let Some(ref origin_host) = hit.origin_host {
+                let normalized_origin_kind = normalized_robot_hit_origin_kind(hit);
+                map.serialize_entry("source_id", &normalized_source_id)?;
+                map.serialize_entry("origin_kind", &normalized_origin_kind)?;
+                if let Some(ref origin_host) = normalized_origin_host {
                     map.serialize_entry("origin_host", origin_host)?;
                 }
                 map.end()
@@ -6862,15 +8296,19 @@ fn output_robot_results(
                     "title".to_string(),
                     serde_json::Value::String(hit.title.clone()),
                 );
-                map.insert(
-                    "score".to_string(),
-                    serde_json::to_value(hit.score).unwrap_or_default(),
-                );
+                map.insert("score".to_string(), safe_robot_score_value(hit.score));
                 serde_json::Value::Object(map)
             })
             .collect()
     } else if passthrough_all_fields && !needs_truncation {
-        match serde_json::to_value(&result.hits).unwrap_or_default() {
+        // Sanitize NaN/Infinity scores before bulk serialization — serde_json
+        // cannot represent non-finite floats, which would silently drop all hits.
+        let sanitized: Vec<_> = result
+            .hits
+            .iter()
+            .map(normalized_robot_hit_for_output)
+            .collect();
+        match serde_json::to_value(&sanitized).unwrap_or_default() {
             serde_json::Value::Array(values) => values,
             _ => Vec::new(),
         }
@@ -7409,33 +8847,91 @@ fn output_robot_results(
     Ok(())
 }
 
+fn source_filter_where_clause(
+    source_filter: Option<&crate::sources::provenance::SourceFilter>,
+) -> (String, Option<String>) {
+    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    match source_filter {
+        None | Some(crate::sources::provenance::SourceFilter::All) => (String::new(), None),
+        Some(crate::sources::provenance::SourceFilter::Local) => (
+            format!(
+                " WHERE {normalized_source_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ),
+            None,
+        ),
+        Some(crate::sources::provenance::SourceFilter::Remote) => (
+            format!(
+                " WHERE {normalized_source_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ),
+            None,
+        ),
+        Some(crate::sources::provenance::SourceFilter::SourceId(id)) => (
+            format!(" WHERE {normalized_source_sql} = ?"),
+            Some(
+                canonical_followup_source_id(Some(id.as_str()))
+                    .unwrap_or_else(|| id.trim().to_string()),
+            ),
+        ),
+    }
+}
+
+fn append_source_filter_condition(
+    sql: &mut String,
+    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    source_filter: &crate::sources::provenance::SourceFilter,
+) {
+    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    match source_filter {
+        crate::sources::provenance::SourceFilter::All => {}
+        crate::sources::provenance::SourceFilter::Local => {
+            sql.push_str(&format!(
+                " AND {normalized_source_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ));
+        }
+        crate::sources::provenance::SourceFilter::Remote => {
+            sql.push_str(&format!(
+                " AND {normalized_source_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ));
+        }
+        crate::sources::provenance::SourceFilter::SourceId(id) => {
+            sql.push_str(&format!(
+                " AND {normalized_source_sql} = ?{}",
+                params.len() + 1
+            ));
+            params.push(
+                canonical_followup_source_id(Some(id.as_str()))
+                    .unwrap_or_else(|| id.trim().to_string())
+                    .into(),
+            );
+        }
+    }
+}
+
 fn run_stats(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     source: Option<&str>,
     by_source: bool,
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use frankensqlite::compat::{ParamValue, RowExt};
 
-    let lazy =
-        crate::storage::sqlite::LazyFrankenDb::from_overrides(data_dir_override, db_override);
-    let conn = lazy.get("stats").map_err(lazy_db_to_cli_error)?;
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
 
     // Build WHERE clause for source filtering
-    let (source_where, source_param): (String, Option<String>) = match &source_filter {
-        None | Some(SourceFilter::All) => (String::new(), None),
-        Some(SourceFilter::Local) => (" WHERE c.source_id = 'local'".to_string(), None),
-        Some(SourceFilter::Remote) => (" WHERE c.source_id != 'local'".to_string(), None),
-        Some(SourceFilter::SourceId(id)) => {
-            (" WHERE c.source_id = ?".to_string(), Some(id.clone()))
-        }
-    };
+    let (source_where, source_param): (String, Option<String>) =
+        source_filter_where_clause(source_filter.as_ref());
 
     // Helper: build params slice from optional source param
     let make_params = |param: &Option<String>| -> Vec<ParamValue> {
@@ -7447,30 +8943,46 @@ fn run_stats(
 
     // Get counts and statistics with source filter
     let params = make_params(&source_param);
-    let conversation_count: i64 = conn
-        .query_row_map(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            &params,
-            |r| r.get_typed(0),
-        )
-        .unwrap_or(0);
-
-    let message_count: i64 = conn
-        .query_row_map(
-            &format!(
-                "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-            ),
-            &params,
-            |r| r.get_typed(0),
-        )
-        .unwrap_or(0);
-
-    // Get per-agent breakdown with source filter
-    let agent_sql = format!(
-        "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY a.slug ORDER BY COUNT(*) DESC"
+    let conversation_sql = format!("SELECT COUNT(*) FROM conversations c{source_where}");
+    let message_sql = format!(
+        "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
     );
-    let agent_rows: Vec<(String, i64)> = conn
-        .query_map_collect(&agent_sql, &params, |r| {
+
+    let mut conversation_count: i64 =
+        franken_query_row_map_retry(&conn, &conversation_sql, &params, |r| r.get_typed(0))
+            .unwrap_or(0);
+
+    let mut message_count: i64 =
+        franken_query_row_map_retry(&conn, &message_sql, &params, |r| r.get_typed(0)).unwrap_or(0);
+    if conversation_count == 0 {
+        conversation_count = fresh_franken_count_retry(
+            &db_path,
+            "stats",
+            Duration::from_secs(30),
+            &conversation_sql,
+            &params,
+        )
+        .unwrap_or(0);
+    }
+    if message_count == 0 {
+        message_count = fresh_franken_count_retry(
+            &db_path,
+            "stats",
+            Duration::from_secs(30),
+            &message_sql,
+            &params,
+        )
+        .unwrap_or(0);
+    }
+
+    // Get per-agent breakdown with source filter.  LEFT JOIN + COALESCE so
+    // legacy NULL-agent conversations aren't silently excluded from the
+    // breakdown (they collapse into a single 'unknown' bucket instead).
+    let agent_sql = format!(
+        "SELECT COALESCE(a.slug, 'unknown'), COUNT(*) FROM conversations c LEFT JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY COALESCE(a.slug, 'unknown') ORDER BY COUNT(*) DESC"
+    );
+    let agent_rows: Vec<(String, i64)> =
+        franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
             Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
         .map_err(|e| CliError::unknown(format!("query: {e}")))?;
@@ -7479,8 +8991,8 @@ fn run_stats(
     let ws_sql = format!(
         "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id{source_where} GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
     );
-    let ws_rows: Vec<(String, i64)> = conn
-        .query_map_collect(&ws_sql, &params, |r| {
+    let ws_rows: Vec<(String, i64)> =
+        franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
             Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
         .map_err(|e| CliError::unknown(format!("query: {e}")))?;
@@ -7496,23 +9008,25 @@ fn run_stats(
             "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_where} AND started_at IS NOT NULL"
         )
     };
-    let (oldest, newest): (Option<i64>, Option<i64>) = conn
-        .query_row_map(&date_sql, &params, |r| {
+    let (oldest, newest): (Option<i64>, Option<i64>) =
+        franken_query_row_map_retry(&conn, &date_sql, &params, |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
         .unwrap_or((None, None));
 
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
+        let normalized_source_sql =
+            normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
         let source_sql = format!(
-            "SELECT c.source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
+            "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              {source_where}
-             GROUP BY c.source_id
+             GROUP BY {normalized_source_sql}
              ORDER BY convs DESC"
         );
-        conn.query_map_collect(&source_sql, &params, |r| {
+        franken_query_map_collect_retry(&conn, &source_sql, &params, |r| {
             Ok((
                 r.get_typed::<String>(0)?,
                 r.get_typed::<i64>(1)?,
@@ -7524,12 +9038,7 @@ fn run_stats(
         Vec::new()
     };
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -7547,7 +9056,7 @@ fn run_stats(
                 "oldest": oldest.and_then(|ts| chrono::DateTime::from_timestamp_millis(ts).map(|d| d.to_rfc3339())),
                 "newest": newest.and_then(|ts| chrono::DateTime::from_timestamp_millis(ts).map(|d| d.to_rfc3339())),
             },
-            "db_path": lazy.path().display().to_string(),
+            "db_path": db_path.display().to_string(),
         });
 
         // Add source filter info if specified (P3.7)
@@ -7582,7 +9091,7 @@ fn run_stats(
     };
     println!("{title}");
     println!("{}", "=".repeat(title.len()));
-    println!("Database: {}", lazy.path().display());
+    println!("Database: {}", db_path.display());
     println!();
 
     // Show by_source breakdown if requested (P3.7)
@@ -7631,11 +9140,10 @@ fn run_stats(
 fn run_diag(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     verbose: bool,
 ) -> CliResult<()> {
-    use frankensqlite::Connection;
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::compat::RowExt;
     use frankensqlite::params;
     use std::fs;
 
@@ -7649,22 +9157,53 @@ fn run_diag(
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
         let size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-        let (convs, msgs) =
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) {
-                let convs: i64 = conn
-                    .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                        r.get_typed(0)
-                    })
+        let (convs, msgs) = match open_franken_cli_read_db(
+            db_path.clone(),
+            "diagnostics",
+            CLI_DIAG_DB_OPEN_TIMEOUT,
+        ) {
+            Ok(conn) => {
+                let mut convs: i64 = franken_query_row_map_retry(
+                    &conn,
+                    "SELECT COUNT(*) FROM conversations",
+                    params![],
+                    |r| r.get_typed(0),
+                )
+                .unwrap_or(0);
+                let mut msgs: i64 = franken_query_row_map_retry(
+                    &conn,
+                    "SELECT COUNT(*) FROM messages",
+                    params![],
+                    |r| r.get_typed(0),
+                )
+                .unwrap_or(0);
+                if convs == 0 {
+                    convs = fresh_franken_count_retry(
+                        &db_path,
+                        "diagnostics",
+                        CLI_DIAG_DB_OPEN_TIMEOUT,
+                        "SELECT COUNT(*) FROM conversations",
+                        params![],
+                    )
                     .unwrap_or(0);
-                let msgs: i64 = conn
-                    .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                        r.get_typed(0)
-                    })
+                }
+                if msgs == 0 {
+                    msgs = fresh_franken_count_retry(
+                        &db_path,
+                        "diagnostics",
+                        CLI_DIAG_DB_OPEN_TIMEOUT,
+                        "SELECT COUNT(*) FROM messages",
+                        params![],
+                    )
                     .unwrap_or(0);
+                }
                 (convs, msgs)
-            } else {
-                (0, 0)
-            };
+            }
+            Err(e) => {
+                tracing::warn!("failed to open database for diagnostics: {e}");
+                (-1, -1)
+            }
+        };
         (true, size, convs, msgs)
     } else {
         (false, 0, 0, 0)
@@ -7689,16 +9228,32 @@ fn run_diag(
             (name, path, exists)
         })
         .collect();
+    let mut connector_paths_by_name: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for (name, path, exists) in &agent_paths {
+        if *exists {
+            connector_paths_by_name
+                .entry(public_connector_slug(name).to_string())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let connector_rows: Vec<(String, String, bool)> = capabilities_connector_names()
+        .into_iter()
+        .map(|name| {
+            let path = connector_paths_by_name
+                .get(&name)
+                .and_then(|paths| paths.first())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(not detected)".to_string());
+            let found = path != "(not detected)";
+            (name, path, found)
+        })
+        .collect();
 
     let platform = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -7725,11 +9280,11 @@ fn run_diag(
                 "exists": index_exists,
                 "size_bytes": index_size,
             },
-            "connectors": agent_paths.iter().map(|(name, path, exists)| {
+            "connectors": connector_rows.iter().map(|(name, path, found)| {
                 serde_json::json!({
                     "name": name,
-                    "path": path.display().to_string(),
-                    "found": exists,
+                    "path": path,
+                    "found": found,
                 })
             }).collect::<Vec<_>>(),
         });
@@ -7772,9 +9327,9 @@ fn run_diag(
     }
     println!();
     println!("Connector Search Paths:");
-    for (name, path, exists) in &agent_paths {
-        let status = if *exists { "✓" } else { "✗" };
-        println!("  {} {}: {}", status, name, path.display());
+    for (name, path, found) in &connector_rows {
+        let status = if *found { "✓" } else { "✗" };
+        println!("  {} {}: {}", status, name, path);
     }
 
     Ok(())
@@ -7917,90 +9472,125 @@ fn truncate_end(s: &str, max_chars: usize) -> String {
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
-    use frankensqlite::Connection;
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::params;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Use the actual versioned index path (index/v4, not tantivy_index)
-    let index_path = crate::search::tantivy::index_dir(&data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
-    let watch_state_path = data_dir.join("watch_state.json");
+    let mut state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
+    refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
 
-    // Check if database exists
-    let db_exists = db_path.exists();
-    let index_exists = index_path.exists();
-
-    // Get current timestamp
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+    let index_exists = state
+        .get("index")
+        .and_then(|i| i.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|i| i.get("fresh"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_age_secs = state
+        .get("index")
+        .and_then(|i| i.get("age_seconds"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let is_stale = state
+        .get("index")
+        .and_then(|i| i.get("stale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let rebuild_processed = state
+        .get("rebuild")
+        .and_then(|r| r.get("processed_conversations"))
+        .and_then(|v| v.as_u64());
+    let rebuild_total = state
+        .get("rebuild")
+        .and_then(|r| r.get("total_conversations"))
+        .and_then(|v| v.as_u64());
+    let db_exists = state
+        .get("database")
+        .and_then(|d| d.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_open_error = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let db_open_retryable = state
+        .get("database")
+        .and_then(|d| d.get("open_retryable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let counts_skipped = state
+        .get("database")
+        .and_then(|d| d.get("counts_skipped"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|p| p.get("sessions"))
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let semantic_summary = state
+        .get("semantic")
+        .and_then(|s| s.get("summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Semantic asset status unknown");
+    let semantic_status = state
+        .get("semantic")
+        .and_then(|s| s.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let semantic_hint = state
+        .get("semantic")
+        .and_then(|s| s.get("hint"))
+        .and_then(|v| v.as_str());
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|i| i.get("empty_with_messages"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // Default values if db doesn't exist
-    let mut conversation_count: i64 = 0;
-    let mut message_count: i64 = 0;
-    let mut last_indexed_at: Option<i64> = None;
-
-    if db_exists && let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) {
-        // Get counts
-        conversation_count = conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        message_count = conn
-            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-
-        // Get last indexed timestamp from meta table
-        last_indexed_at = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                params![],
-                |r| r.get_typed::<String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
-    }
-
-    // Calculate index age and staleness
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000; // Convert millis to secs
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
-    });
-    let is_stale = match index_age_secs {
-        None => true,
-        Some(age) => age > stale_threshold,
-    };
-
-    // Check for pending sessions from watch_state.json
-    let pending_sessions = if watch_state_path.exists() {
-        std::fs::read_to_string(&watch_state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|v| v.get("pending_count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
+    let db_available = db_opened || (db_exists && db_open_retryable);
+    let healthy = db_exists
+        && db_available
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
+        "healthy"
+    } else if db_exists && !db_available {
+        "degraded"
     } else {
-        0
+        "unhealthy"
     };
 
-    // Determine overall health
-    let healthy = db_exists && index_exists && !is_stale;
-
-    // Build recommended action
-    let recommended_action = if !db_exists {
+    let recommended_action = if rebuild_active {
+        Some("Index rebuild is already in progress".to_string())
+    } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
+    } else if !db_available {
+        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_empty_with_messages {
+        Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -8014,12 +9604,7 @@ fn run_status(
         None
     };
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -8028,45 +9613,39 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
-        let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
         let payload = serde_json::json!({
+            "status": status,
             "healthy": healthy,
-            "index": {
-                "exists": index_exists,
-                "fresh": !is_stale,
-                "last_indexed_at": last_indexed_at.map(|ts| {
-                    chrono::DateTime::from_timestamp_millis(ts)
-                        .map(|d| d.to_rfc3339())
-                }),
-                "age_seconds": index_age_secs,
-                "stale": is_stale,
-                "stale_threshold_seconds": stale_threshold,
-            },
-            "database": {
+            "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            "database": serde_json::json!({
                 "exists": db_exists,
-                "conversations": conversation_count,
-                "messages": message_count,
+                "opened": db_opened,
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
                 "path": db_path.display().to_string(),
-            },
-            "pending": {
-                "sessions": pending_sessions,
-                "watch_active": watch_state_path.exists(),
-            },
+                "open_error": db_open_error,
+                "open_retryable": db_open_retryable,
+                "counts_skipped": counts_skipped,
+            }),
+            "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
+            "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "recommended_action": recommended_action,
-            "_meta": {
-                "timestamp": ts_str,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-            },
+            "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
     }
 
-    // Human-readable output
-    let status_icon = if healthy { "✓" } else { "!" };
-    let status_word = if healthy {
+    let status_icon = if healthy {
+        "✓"
+    } else if rebuild_active {
+        "~"
+    } else {
+        "!"
+    };
+    let status_word = if rebuild_active {
+        "Rebuilding"
+    } else if healthy {
         "Healthy"
     } else {
         "Attention needed"
@@ -8075,10 +9654,9 @@ fn run_status(
     println!("{status_icon} CASS Status: {status_word}");
     println!();
 
-    // Index info
     println!("Index:");
     if index_exists {
-        if let Some(age) = index_age_secs {
+        if let Some(age) = index_age_secs.as_u64() {
             let age_str = if age < 60 {
                 format!("{age} seconds ago")
             } else if age < 3600 {
@@ -8093,27 +9671,72 @@ fn run_status(
         } else {
             println!("  Last indexed: unknown");
         }
+        if rebuild_active {
+            match (rebuild_processed, rebuild_total) {
+                (Some(processed), Some(total)) => {
+                    println!("  Rebuild progress: {processed}/{total} conversations committed");
+                }
+                _ => println!("  Rebuild progress: in progress"),
+            }
+        }
+        if index_empty_with_messages {
+            println!("  Warning: index has 0 documents but database has messages");
+            println!("  Run 'cass index --full' to populate the search index");
+        }
     } else {
         println!("  Not found - run 'cass index --full'");
     }
 
-    // Database info
     println!();
     println!("Database:");
     if db_exists {
-        println!("  Conversations: {conversation_count}");
-        println!("  Messages: {message_count}");
+        if db_opened {
+            if counts_skipped {
+                println!("  Counts skipped for fast status on large database");
+            } else {
+                if let Some(conversations) = state
+                    .get("database")
+                    .and_then(|d| d.get("conversations"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Conversations: {conversations}");
+                }
+                if let Some(messages) = state
+                    .get("database")
+                    .and_then(|d| d.get("messages"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Messages: {messages}");
+                }
+            }
+        } else if db_open_retryable {
+            println!("  Temporarily busy during probe");
+            if let Some(err) = &db_open_error {
+                println!("  Probe error: {err}");
+            }
+        } else {
+            println!("  Exists, but could not be opened");
+            if let Some(err) = &db_open_error {
+                println!("  Error: {err}");
+            }
+        }
     } else {
         println!("  Not found");
     }
 
-    // Pending
+    println!();
+    println!("Semantic:");
+    println!("  Status: {semantic_status}");
+    println!("  Summary: {semantic_summary}");
+    if let Some(hint) = semantic_hint {
+        println!("  Hint: {hint}");
+    }
+
     if pending_sessions > 0 {
         println!();
         println!("Pending: {pending_sessions} sessions awaiting indexing");
     }
 
-    // Recommended action
     if let Some(action) = &recommended_action {
         println!();
         println!("Recommended: {action}");
@@ -8124,10 +9747,13 @@ fn run_status(
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
+///
+/// Invariant: when --json is requested, this function ALWAYS emits valid JSON
+/// to stdout before returning, even if the database is corrupt or WAL-damaged.
 fn run_health(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
@@ -8148,28 +9774,81 @@ fn run_health(
         .and_then(|i| i.get("fresh"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|d| d.get("exists"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Extract any DB open error (e.g. WAL corruption) captured by state_meta_json.
+    let db_open_error: Option<String> = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let pending_sessions = state
         .get("pending")
         .and_then(|p| p.get("sessions"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|i| i.get("empty_with_messages"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // Core operational health: can the tool be used at all?
-    // Freshness and pending sessions are informational (reported in state) but don't prevent searching
-    let healthy = db_exists && index_exists;
+    let db_degraded = db_exists && !db_opened;
+    let healthy = db_exists
+        && db_opened
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
+
+    // Collect structured errors for the JSON response.
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(ref err) = db_open_error {
+        errors.push(err.clone());
+    }
+    if !db_exists {
+        errors.push("database not found".to_string());
+    }
+    if !index_exists {
+        errors.push("index not found".to_string());
+    }
+    if !index_fresh {
+        errors.push("index stale".to_string());
+    }
+    if rebuild_active {
+        errors.push("index rebuild in progress".to_string());
+    }
+    if index_empty_with_messages {
+        errors.push("index empty but database has messages — run 'cass index --full'".to_string());
+    }
+
+    // Determine status string for structured output.
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
+        "healthy"
+    } else if db_degraded {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -8178,21 +9857,42 @@ fn run_health(
     });
 
     if let Some(fmt) = structured_format {
+        // Always emit valid JSON — even on WAL corruption or other DB errors.
+        // This is the core invariant for --json mode.
         let payload = serde_json::json!({
+            "status": status,
             "healthy": healthy,
+            "errors": errors,
             "latency_ms": latency_ms,
+            "db": {
+                "exists": db_exists,
+                "opened": db_opened,
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
+                "open_error": db_open_error,
+                "counts_skipped": state
+                    .get("database")
+                    .and_then(|d| d.get("counts_skipped"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Bool(false))
+            },
             "state": state
         });
         output_structured_value(payload, fmt)?;
     } else if healthy {
         println!("✓ Healthy ({latency_ms}ms)");
-        // Show informational warnings even when healthy
-        if !index_fresh {
-            println!("  Note: index stale (older than {}s)", stale_threshold);
-        }
         if pending_sessions > 0 {
             println!("  Note: {pending_sessions} sessions pending reindex");
         }
+    } else if rebuild_active {
+        println!("~ Rebuilding ({latency_ms}ms)");
+        println!("  - index rebuild is in progress");
+    } else if db_degraded {
+        println!("⚠ Degraded ({latency_ms}ms) - database exists but could not be opened");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        println!("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.");
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
         if !db_exists {
@@ -8201,11 +9901,37 @@ fn run_health(
         if !index_exists {
             println!("  - index not found");
         }
+        if index_empty_with_messages {
+            println!("  - index has 0 documents but database has messages");
+        }
         println!("Run 'cass index --full' or 'cass index --watch' to create index.");
     }
 
     if healthy {
         Ok(())
+    } else if rebuild_active {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: "Index rebuild is still in progress".to_string(),
+            hint: Some("Wait for the active 'cass index' run to finish.".to_string()),
+            retryable: true,
+        })
+    } else if db_degraded {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: format!(
+                "Database degraded: {}",
+                db_open_error
+                    .as_deref()
+                    .unwrap_or("could not open database")
+            ),
+            hint: Some(
+                "Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string(),
+            ),
+            retryable: false,
+        })
     } else {
         Err(CliError {
             code: 1,
@@ -8262,154 +9988,15 @@ fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
-    use crate::model::types::MessageRole;
-    use crate::search::tantivy::TantivyIndex;
-    use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceKind};
-    use crate::storage::sqlite::SqliteStorage;
-    use std::collections::HashMap;
-    use std::sync::atomic::Ordering;
-
-    let storage = SqliteStorage::open_readonly(db_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to open database for rebuild: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let sources = storage.list_sources().unwrap_or_default();
-    let mut source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
-    for source in sources {
-        source_map.insert(source.id, (source.kind, source.host_label));
-    }
-
-    let index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to resolve index path: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let _ = std::fs::remove_dir_all(&index_path);
-    std::fs::create_dir_all(&index_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to create index directory: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let mut t_index = TantivyIndex::open_or_create(&index_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to create tantivy index: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    if let Some(p) = &progress {
-        p.phase.store(2, Ordering::Relaxed);
-        p.is_rebuilding.store(true, Ordering::Relaxed);
-        p.total.store(total_conversations, Ordering::Relaxed);
-        p.current.store(0, Ordering::Relaxed);
-        p.discovered_agents.store(0, Ordering::Relaxed);
-    }
-
-    let page_size: i64 = 200;
-    let mut offset: i64 = 0;
-    let mut indexed_docs: usize = 0;
-
-    loop {
-        let batch = storage
-            .list_conversations(page_size, offset)
-            .map_err(|e| CliError::unknown(format!("failed to list conversations: {e}")))?;
-        if batch.is_empty() {
-            break;
-        }
-
-        for conv in batch {
-            let Some(conv_id) = conv.id else {
-                continue;
-            };
-
-            let messages = storage
-                .fetch_messages(conv_id)
-                .map_err(|e| CliError::unknown(format!("failed to fetch messages: {e}")))?;
-
-            let mut metadata = conv.metadata_json.clone();
-            let (kind, host_label) =
-                source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
-                    let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
-                        SourceKind::Local
-                    } else {
-                        SourceKind::Ssh
-                    };
-                    (fallback_kind, None)
-                });
-
-            let host = conv.origin_host.as_deref().or(host_label.as_deref());
-            ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
-
-            let normalized_messages: Vec<NormalizedMessage> = messages
-                .into_iter()
-                .map(|msg| {
-                    let role = match msg.role {
-                        MessageRole::User => "user".to_string(),
-                        MessageRole::Agent => "assistant".to_string(),
-                        MessageRole::Tool => "tool".to_string(),
-                        MessageRole::System => "system".to_string(),
-                        MessageRole::Other(other) => other,
-                    };
-
-                    NormalizedMessage {
-                        idx: msg.idx,
-                        role,
-                        author: msg.author,
-                        created_at: msg.created_at,
-                        content: msg.content,
-                        extra: msg.extra_json,
-                        snippets: Vec::new(),
-                    }
-                })
-                .collect();
-
-            let normalized = NormalizedConversation {
-                agent_slug: conv.agent_slug,
-                external_id: conv.external_id,
-                title: conv.title,
-                workspace: conv.workspace,
-                source_path: conv.source_path,
-                started_at: conv.started_at,
-                ended_at: conv.ended_at,
-                metadata,
-                messages: normalized_messages,
-            };
-
-            indexed_docs += normalized.messages.len();
-            t_index
-                .add_messages(&normalized, &normalized.messages)
-                .map_err(|e| CliError::unknown(format!("failed to index messages: {e}")))?;
-
-            if let Some(p) = &progress {
-                p.current.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        offset += page_size;
-    }
-
-    t_index
-        .commit()
-        .map_err(|e| CliError::unknown(format!("failed to commit index: {e}")))?;
-
-    if let Some(p) = &progress {
-        p.phase.store(0, Ordering::Relaxed);
-        p.is_rebuilding.store(false, Ordering::Relaxed);
-    }
-
-    Ok(indexed_docs)
+    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress).map_err(
+        |e| CliError {
+            code: 5,
+            kind: "doctor",
+            message: format!("failed to rebuild Tantivy index from database: {e}"),
+            hint: None,
+            retryable: true,
+        },
+    )
 }
 
 fn wait_with_progress<T>(
@@ -8421,6 +10008,8 @@ fn wait_with_progress<T>(
 ) -> CliResult<T> {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+
+    let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
 
     if show_progress {
         use indicatif::{ProgressBar, ProgressStyle};
@@ -8524,11 +10113,7 @@ fn wait_with_progress<T>(
         let total = progress.total.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
         let agents = progress.discovered_agents.load(Ordering::Relaxed);
-        pb.finish_with_message(format!(
-            "Done: {} conversations from {} agent(s)",
-            current.max(total),
-            agents
-        ));
+        progress_completion = Some((pb, current.max(total), agents));
     } else if show_plain {
         eprintln!("Starting index...");
         let mut last_phase = usize::MAX;
@@ -8586,13 +10171,1014 @@ fn wait_with_progress<T>(
         }
     }
 
-    handle.join().map_err(|_| CliError {
-        code: 9,
-        kind: "doctor",
-        message: "doctor worker thread panicked".to_string(),
-        hint: None,
-        retryable: true,
-    })?
+    let result = match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(CliError {
+            code: 9,
+            kind: "doctor",
+            message: "doctor worker thread panicked".to_string(),
+            hint: None,
+            retryable: true,
+        }),
+    };
+
+    if let Some((pb, conversations, agents)) = progress_completion {
+        match &result {
+            Ok(_) => pb.finish_with_message(format!(
+                "Done: {} conversations from {} agent(s)",
+                conversations, agents
+            )),
+            Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
+        }
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorFtsTableState {
+    QueryableViaFrankensqlite,
+    Missing { frankensqlite_error: String },
+}
+
+fn probe_doctor_fts_table(
+    conn: &crate::storage::sqlite::SendFrankenConnection,
+) -> DoctorFtsTableState {
+    match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
+        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
+        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
+            frankensqlite_error: frankensqlite_error.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod doctor_fts_tests {
+    use super::*;
+
+    fn create_search_schema(
+        conn: &frankensqlite::Connection,
+    ) -> Result<(), frankensqlite::FrankenError> {
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );",
+        )
+    }
+
+    #[test]
+    fn doctor_fts_probe_accepts_frankensqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("legacy-fts.db");
+
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        create_search_schema(&conn)?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
+             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(7, 1, 0, 'retro investigation', 42);
+             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
+        )?;
+        let state =
+            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
+        assert!(
+            matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
+            "frankensqlite FTS table should be accepted by doctor: {state:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_fts_probe_reports_missing_fts_table() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("missing-fts.db");
+
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        create_search_schema(&conn)?;
+        let state =
+            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
+        assert!(
+            matches!(state, DoctorFtsTableState::Missing { .. }),
+            "missing FTS table should be reported as missing: {state:?}"
+        );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cli_read_db_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use fs2::FileExt;
+    use tempfile::TempDir;
+
+    fn seed_cli_db() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open cass db");
+        storage
+            .set_last_indexed_at(1_733_000_000_000)
+            .expect("set last_indexed_at");
+        drop(storage);
+        (temp, db_path)
+    }
+
+    #[test]
+    fn analytics_db_open_is_readonly() {
+        let (temp, _db_path) = seed_cli_db();
+        let data_dir = Some(temp.path().to_path_buf());
+        let conn = open_franken_analytics_db(&data_dir, None).expect("open readonly analytics db");
+
+        let err = conn
+            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);")
+            .expect_err("analytics reader must not accept writes");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("readonly") || message.contains("query_only"),
+            "unexpected readonly failure surface: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_state_db_reads_meta_without_count_scan() {
+        let (_temp, db_path) = seed_cli_db();
+        let snapshot = probe_state_db(&db_path, "status", Duration::from_millis(250), false);
+
+        assert!(snapshot.opened, "state probe should open the database");
+        assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert!(snapshot.counts_skipped, "count scan should remain disabled");
+        assert_eq!(snapshot.conversation_count, 0);
+        assert_eq!(snapshot.message_count, 0);
+        assert!(
+            snapshot.open_error.is_none(),
+            "state probe should not report an error: {:?}",
+            snapshot.open_error
+        );
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "10:42:0:0"
+                },
+                "page_size": 200,
+                "committed_offset": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": false,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(6));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_555_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+        assert_eq!(
+            state["rebuild"]["processed_conversations"],
+            serde_json::Value::Null
+        );
+        assert!(state["rebuild"]["updated_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn state_meta_json_reports_watch_active_without_marking_rebuild() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch",
+            std::process::id(),
+            1_733_000_777_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["pending"]["watch_active"].as_bool(), Some(true));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(false));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn state_meta_json_reports_orphaned_lock_metadata() {
+        // Since issue #176, stale lock metadata from dead owners is reaped
+        // on read rather than reported as orphaned.  The read path acquires
+        // an exclusive flock, discovers no live holder, truncates the file,
+        // and returns a clean default snapshot.  Verify that the state_meta
+        // JSON reflects the reaped (clean) state.
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms={}\n",
+                    "updated_at_ms={}\n",
+                    "db_path={}\n",
+                    "mode=index\n",
+                    "job_id={}\n",
+                    "job_kind=lexical_refresh\n",
+                    "phase=rebuilding\n"
+                ),
+                4242_u32,
+                1_733_000_888_000_i64,
+                1_733_000_999_000_i64,
+                db_path.display(),
+                "lexical_refresh-1733000888000-4242"
+            ),
+        )
+        .expect("write orphaned lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        // Stale metadata is reaped on read (issue #176); orphaned is false.
+        assert_eq!(state["pending"]["orphaned"].as_bool(), Some(false));
+        assert_eq!(state["rebuild"]["orphaned"].as_bool(), Some(false));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(false));
+        // After reap the metadata fields are absent (default snapshot).
+        assert_eq!(state["rebuild"]["job_kind"].as_str(), None);
+        assert_eq!(state["rebuild"]["phase"].as_str(), None);
+    }
+
+    #[test]
+    fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
+            .expect("create unreadable rebuild state path");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            concat!(
+                "pid={}\n",
+                "started_at_ms={}\n",
+                "updated_at_ms={}\n",
+                "db_path={}\n",
+                "mode=index\n"
+            ),
+            std::process::id(),
+            1_733_000_555_000_i64,
+            1_733_000_666_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["status"].as_str(), Some("error"));
+        assert_eq!(
+            state["index"]["activity_at"].as_str(),
+            Some("2024-11-30T21:04:26+00:00")
+        );
+        assert!(
+            state["index"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("asset inspection failed"))
+        );
+    }
+
+    #[test]
+    fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            temp.path().join("watch_state.json"),
+            br#"{"amp":1700000000000}"#,
+        )
+        .expect("write watch state");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "stale-fingerprint"
+                },
+                "page_size": 200,
+                "committed_offset": 10,
+                "processed_conversations": 10,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": true,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["status"].as_str(), Some("stale"));
+        assert_eq!(state["index"]["stale"].as_bool(), Some(true));
+        assert_eq!(
+            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            state["index"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("fingerprint"))
+        );
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            state["rebuild"]["total_conversations"],
+            serde_json::Value::Null
+        );
+        assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
+        assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
+    }
+
+    #[test]
+    fn active_index_run_details_reads_matching_lock_metadata() {
+        let (temp, db_path) = seed_cli_db();
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            4242_u32,
+            1_733_001_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let details =
+            active_index_run_details(temp.path(), &db_path).expect("matching active index run");
+        assert_eq!(details.pid, Some(4242));
+        assert_eq!(details.started_at_ms, Some(1_733_001_111_000));
+        assert_eq!(details.data_dir, temp.path());
+        assert_eq!(details.db_path, db_path);
+        assert_eq!(
+            details.started_at_rfc3339().as_deref(),
+            Some("2024-11-30T21:11:51+00:00")
+        );
+    }
+
+    #[test]
+    fn active_index_run_details_reports_owner_for_other_db_in_same_data_dir() {
+        let (temp, db_path) = seed_cli_db();
+        let other_db_path = temp.path().join("other-agent-search.db");
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            31337_u32,
+            1_733_001_222_000_i64,
+            other_db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let details = active_index_run_details(temp.path(), &db_path)
+            .expect("active lock in same data dir should still be reported");
+        assert_eq!(details.pid, Some(31337));
+        assert_eq!(details.db_path, other_db_path);
+    }
+
+    #[test]
+    fn active_index_busy_cli_error_is_clean_and_structured() {
+        let details = ActiveIndexRunDetails {
+            pid: Some(777),
+            started_at_ms: Some(1_733_001_333_000_i64),
+            data_dir: PathBuf::from("/tmp/cass-data"),
+            db_path: PathBuf::from("/tmp/cass-data/agent_search.db"),
+            job_id: Some("lexical_refresh-1733001333000-777".to_string()),
+            job_kind: Some(crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh),
+            phase: Some("rebuilding".to_string()),
+        };
+
+        let err = details.to_cli_error();
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, "index_busy");
+        assert!(err.retryable);
+        assert!(
+            err.message
+                .contains("another 'cass index' run is already active"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("pid 777"),
+            "pid should be surfaced cleanly: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("/tmp/cass-data"),
+            "data dir/db should be surfaced cleanly: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("--data-dir/--db")),
+            "unexpected hint: {:?}",
+            err.hint
+        );
+
+        let payload = cli_error_json_payload(&err, 1234);
+        assert_eq!(payload["success"].as_bool(), Some(false));
+        assert_eq!(payload["elapsed_ms"].as_u64(), Some(1234));
+        assert_eq!(payload["code"].as_i64(), Some(7));
+        assert_eq!(payload["kind"].as_str(), Some("index_busy"));
+        assert_eq!(payload["retryable"].as_bool(), Some(true));
+    }
+
+    // =====================================================
+    // `cass resume` — issue #175
+    // =====================================================
+
+    #[test]
+    fn resume_detects_claude_code_from_path() {
+        let path = PathBuf::from(
+            "/Users/ellis/.claude/projects/-home-ellis-proj/abc12345-dead-beef-cafe-0123456789ab.jsonl",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "claude");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("abc12345-dead-beef-cafe-0123456789ab")
+        );
+        assert_eq!(
+            target.argv,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "abc12345-dead-beef-cafe-0123456789ab".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_detects_codex_from_path() {
+        let path = PathBuf::from(
+            "/Users/ellis/.codex/sessions/fedc1234-babe-cafe-beef-abcdef012345.jsonl",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("fedc1234-babe-cafe-beef-abcdef012345")
+        );
+        assert_eq!(target.argv[0], "codex");
+        assert_eq!(target.argv[1], "resume");
+    }
+
+    #[test]
+    fn resume_detects_opencode_session_from_source_path() {
+        let path = PathBuf::from("/Users/ellis/.local/share/opencode/opencode.db/sess%2D42");
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "opencode");
+        assert_eq!(target.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-42"]);
+    }
+
+    #[test]
+    fn resume_rejects_opencode_path_outside_opencode_db_parent() {
+        // `~/.config/opencode/config.json` matches the opencode detection
+        // heuristic but is NOT a session path. We must refuse to produce
+        // a resume command rather than synthesize a plausible-but-wrong
+        // `opencode resume config.json` invocation.
+        let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
+        let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("opencode.db"),
+            "error should explain the expected shape: {}",
+            err.message
+        );
+        // The hint should point at the override escape hatch.
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--agent opencode")),
+            "hint should advertise the override: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn resume_allows_opencode_path_outside_parent_with_explicit_override() {
+        // With `--agent opencode` the user takes responsibility for the
+        // path shape. Cass uses the final path component as the id.
+        let path = PathBuf::from("/Users/ellis/custom/opencode-export/sess-xyz");
+        let target = resolve_resume_target(&path, Some("opencode"))
+            .expect("explicit override must bypass parent-directory check");
+        assert_eq!(target.agent, "opencode");
+        assert_eq!(target.session_id.as_deref(), Some("sess-xyz"));
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-xyz"]);
+    }
+
+    #[test]
+    fn resume_detects_oh_my_pi_from_omp_path_and_reads_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = temp.path().join(".omp/agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-04-09T00-00-00_abc.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"my-omp-id","timestamp":"2026-04-09T00:00:00Z"}
+{"type":"message","timestamp":"2026-04-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write session file");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(target.session_id.as_deref(), Some("my-omp-id"));
+        // Must choose `omp` because path contains .omp/agent.
+        assert_eq!(target.argv[0], "omp");
+        assert_eq!(target.argv[1], "--resume");
+        assert_eq!(target.argv[2], "my-omp-id");
+    }
+
+    #[test]
+    fn resume_detects_pi_mono_from_pi_path_and_reads_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = temp.path().join(".pi/agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-04-09T00-00-00_def.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"my-pi-id","timestamp":"2026-04-09T00:00:00Z"}"#,
+        )
+        .expect("write session file");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(target.session_id.as_deref(), Some("my-pi-id"));
+        assert_eq!(target.argv[0], "pi");
+    }
+
+    #[test]
+    fn resume_detects_gemini_from_path_and_uses_path_argv() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gemini_sessions = temp.path().join(".gemini/sessions");
+        std::fs::create_dir_all(&gemini_sessions).expect("create dir");
+        let session_file = gemini_sessions.join("2026-04-09T00-00-00.jsonl");
+        std::fs::write(&session_file, b"{}").expect("write session");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "gemini");
+        assert!(target.session_id.is_none());
+        assert_eq!(target.argv[0], "gemini");
+        assert_eq!(target.argv[1], "session");
+        assert_eq!(target.argv[2], "restore");
+    }
+
+    #[test]
+    fn resume_honors_explicit_agent_override() {
+        // Claude path, but we force codex detection — legal alias handling.
+        let path = PathBuf::from("/tmp/unknown/abc-123.jsonl");
+        let target = resolve_resume_target(&path, Some("codex")).expect("resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(target.session_id.as_deref(), Some("abc-123"));
+
+        // `oh-my-pi` alias must normalize to pi_agent AND force the `omp`
+        // binary even when the path doesn't contain `.omp/agent`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sess = temp.path().join("2026-04-09T00-00-00_xyz.jsonl");
+        std::fs::write(&sess, r#"{"type":"session","id":"ov-42"}"#).expect("write");
+        let target = resolve_resume_target(&sess, Some("oh-my-pi")).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(
+            target.argv[0], "omp",
+            "--agent oh-my-pi must force the `omp` binary"
+        );
+        assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+
+        // `pi` alias must force the `pi` binary even when path contains .omp/agent.
+        let omp_dir = temp.path().join(".omp/agent/sessions");
+        std::fs::create_dir_all(&omp_dir).expect("create dir");
+        let omp_sess = omp_dir.join("2026-04-09T00-00-00_pp.jsonl");
+        std::fs::write(&omp_sess, r#"{"type":"session","id":"pp-77"}"#).expect("write");
+        let target = resolve_resume_target(&omp_sess, Some("pi")).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(
+            target.argv[0], "pi",
+            "--agent pi must force the `pi` binary even on .omp/agent paths"
+        );
+
+        // Generic `pi_agent` alias with path hint should still use the hint.
+        let target = resolve_resume_target(&omp_sess, Some("pi_agent")).expect("resolve");
+        assert_eq!(
+            target.argv[0], "omp",
+            "--agent pi_agent falls back to path inference (.omp/agent → omp)"
+        );
+    }
+
+    #[test]
+    fn resume_rejects_unknown_agent_override() {
+        let path = PathBuf::from("/tmp/whatever/xyz.jsonl");
+        let err = resolve_resume_target(&path, Some("bogus")).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid_agent");
+    }
+
+    #[test]
+    fn resume_errors_when_no_agent_detectable() {
+        let path = PathBuf::from("/tmp/somewhere/random/file.txt");
+        let err = resolve_resume_target(&path, None).expect_err("must error");
+        assert_eq!(err.code, 3);
+        assert_eq!(err.kind, "unknown_agent");
+    }
+
+    #[test]
+    fn resume_does_not_false_positive_on_claude_code_substring() {
+        // Paths like `~/projects/my_claude_code_extension/notes.jsonl`
+        // must NOT be misdetected as Claude Code session files. The
+        // canonical path pattern is `.claude/projects/...`.
+        let path = PathBuf::from("/home/user/projects/my_claude_code_extension/notes.jsonl");
+        let err = resolve_resume_target(&path, None).expect_err("must not false-match claude");
+        assert_eq!(err.code, 3);
+        assert_eq!(err.kind, "unknown_agent");
+    }
+
+    #[test]
+    fn looks_like_session_uuid_accepts_canonical_form() {
+        // Canonical 8-4-4-4-12 hex UUIDs (mixed case allowed).
+        assert!(looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789ab"
+        ));
+        assert!(looks_like_session_uuid(
+            "ABC12345-DEAD-BEEF-CAFE-0123456789AB"
+        ));
+        assert!(looks_like_session_uuid(
+            "fedc1234-babe-cafe-beef-abcdef012345"
+        ));
+        assert!(looks_like_session_uuid(
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(looks_like_session_uuid(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn looks_like_session_uuid_rejects_bad_forms() {
+        // Wrong length.
+        assert!(!looks_like_session_uuid(""));
+        assert!(!looks_like_session_uuid("abc"));
+        assert!(!looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789a"
+        )); // 35
+        assert!(!looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789abc"
+        )); // 37
+        // Right length, wrong separator positions.
+        assert!(!looks_like_session_uuid(
+            "abc1234-5dead-beef-cafe-0123456789ab"
+        ));
+        // Non-hex characters.
+        assert!(!looks_like_session_uuid(
+            "xyz12345-dead-beef-cafe-0123456789ab"
+        ));
+        // Common wrong-path mistakes.
+        assert!(!looks_like_session_uuid("2026-04-09T10-00-00_notes"));
+        assert!(!looks_like_session_uuid("my_project_name"));
+        assert!(!looks_like_session_uuid("notes"));
+    }
+
+    #[test]
+    fn resume_rejects_non_uuid_claude_path_without_override() {
+        // `.claude/projects/foo/notes.jsonl` is under a claude projects
+        // directory but the filename stem is not a UUID. Without an
+        // explicit `--agent`, we block and suggest the user verify the
+        // path.
+        let path = PathBuf::from("/home/u/.claude/projects/-home-proj/notes.jsonl");
+        let err = resolve_resume_target(&path, None)
+            .expect_err("auto-detected non-UUID claude path must be rejected");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("notes"),
+            "error should include the bad stem: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--agent claude")),
+            "hint should point at the override escape hatch: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn resume_allows_non_uuid_claude_path_with_explicit_override() {
+        // With `--agent claude` the user is saying "trust me" — we
+        // accept non-UUID stems as-is and let the downstream harness
+        // decide.
+        let path = PathBuf::from("/home/u/.claude/projects/-home-proj/legacy-name.jsonl");
+        let target = resolve_resume_target(&path, Some("claude"))
+            .expect("explicit override must bypass UUID validation");
+        assert_eq!(target.agent, "claude");
+        assert_eq!(target.session_id.as_deref(), Some("legacy-name"));
+        assert_eq!(target.argv, vec!["claude", "--resume", "legacy-name"]);
+    }
+
+    #[test]
+    fn resume_rejects_non_uuid_codex_path_without_override() {
+        let path = PathBuf::from("/home/u/.codex/sessions/2026/04/09/notes.jsonl");
+        let err = resolve_resume_target(&path, None)
+            .expect_err("auto-detected non-UUID codex path must be rejected");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("Codex"),
+            "error should name the harness: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn run_resume_rejects_exec_with_structured_output() {
+        // `--exec` + `--robot-format json` is a conflict clap cannot
+        // see from the subcommand (robot_format is global). Runtime
+        // rejects it with a clear usage error.
+        let path = PathBuf::from("/home/user/.claude/projects/p/uuid.jsonl");
+        let err = run_resume(&path, None, true, false, Some(RobotFormat::Json))
+            .expect_err("must reject exec + structured output");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`--exec`"),
+            "error should mention --exec: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn run_resume_rejects_shell_with_structured_output() {
+        let path = PathBuf::from("/home/user/.claude/projects/p/uuid.jsonl");
+        let err = run_resume(&path, None, false, true, Some(RobotFormat::Json))
+            .expect_err("must reject shell + structured output");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`--shell`"),
+            "error should mention --shell: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_special_characters() {
+        assert_eq!(shell_quote("safe_value-1.0"), "safe_value-1.0");
+        assert_eq!(shell_quote("has space"), "'has space'");
+        assert_eq!(shell_quote("has'quote"), "'has'\\''quote'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(
+            shell_quote("/abs/path/with-dashes"),
+            "/abs/path/with-dashes"
+        );
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_errors_when_no_header() {
+        // No filename fallback: headerless files must produce an error
+        // rather than a synthesized id that `omp --resume` would reject
+        // with a confusing runtime message.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_stem-id.jsonl");
+        std::fs::write(
+            &f,
+            r#"{"type":"message","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write");
+        let err = extract_pi_agent_session_id(&f).expect_err("must fail without header");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("omp --resume")),
+            "hint should point at the manual invocation: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_prefers_sessionid_field_over_id() {
+        // When a single session-header line contains BOTH `sessionId`
+        // and `id`, `sessionId` wins. The `sessionId` field is the
+        // explicit Oh My Pi resume identifier (per issue #175) while
+        // `id` can be any legacy identifier that happened to be called
+        // `id` in earlier formats.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_sid.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"type":"session","id":"legacy-id","sessionId":"sid-wins"}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "sid-wins");
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_uses_id_when_sessionid_absent() {
+        // A session-header line with only `id` (no `sessionId`) falls
+        // back to `id`. This is the pi-mono format.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_id.jsonl");
+        std::fs::write(
+            &f,
+            r#"{"type":"session","id":"plain-id","timestamp":"2026-04-09T00:00:00Z"}
+{"type":"message","timestamp":"2026-04-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "plain-id");
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_skips_leading_blank_lines() {
+        // Blank lines should not consume the 16-line budget.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_blank.jsonl");
+        let header = r#"{"type":"session","id":"after-blanks"}"#;
+        let content = format!("\n\n\n{header}\n");
+        std::fs::write(&f, content).expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "after-blanks");
+    }
 }
 
 /// Comprehensive diagnostic and repair tool for cass installation.
@@ -8603,7 +11189,7 @@ fn wait_with_progress<T>(
 fn run_doctor(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     fix: bool,
     verbose: bool,
     force_rebuild: bool,
@@ -8674,7 +11260,7 @@ fn run_doctor(
                 false
             );
         }
-    } else {
+    } else if fix {
         if std::fs::create_dir_all(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
@@ -8689,10 +11275,20 @@ fn run_doctor(
             add_check!(
                 "data_directory",
                 "fail",
-                format!("Data directory missing: {}", data_dir.display()),
+                format!("Cannot create data directory: {}", data_dir.display()),
                 true
             );
         }
+    } else {
+        add_check!(
+            "data_directory",
+            "fail",
+            format!(
+                "Data directory missing: {} (run with --fix to create)",
+                data_dir.display()
+            ),
+            true
+        );
     }
 
     // 2. Check for stale lock files
@@ -8704,21 +11300,30 @@ fn run_doctor(
             .unwrap_or(true);
 
         if is_stale {
-            if std::fs::remove_file(&lock_path).is_ok() {
-                checks.push(Check {
-                    name: "lock_file".to_string(),
-                    status: "pass".to_string(),
-                    message: "Stale lock file removed".to_string(),
-                    fix_available: true,
-                    fix_applied: true,
-                });
-                auto_fix_actions.push("Removed stale lock file".to_string());
-                auto_fix_applied = true;
+            if fix {
+                if std::fs::remove_file(&lock_path).is_ok() {
+                    checks.push(Check {
+                        name: "lock_file".to_string(),
+                        status: "pass".to_string(),
+                        message: "Stale lock file removed".to_string(),
+                        fix_available: true,
+                        fix_applied: true,
+                    });
+                    auto_fix_actions.push("Removed stale lock file".to_string());
+                    auto_fix_applied = true;
+                } else {
+                    add_check!(
+                        "lock_file",
+                        "warn",
+                        "Stale lock file found (older than 1 hour) and removal failed",
+                        true
+                    );
+                }
             } else {
                 add_check!(
                     "lock_file",
                     "warn",
-                    "Stale lock file found (older than 1 hour)",
+                    "Stale lock file found (older than 1 hour) - run with --fix to remove",
                     true
                 );
             }
@@ -8735,21 +11340,26 @@ fn run_doctor(
     }
 
     // 3. Check database exists and is readable
+    // Fix #128: Wrap the DB open in a timeout to prevent hanging on degraded databases.
     if db_path.exists() {
-        match frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()) {
+        let db_open_result = {
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    frankensqlite::Connection::open(&db_path_str)
+                        .map(crate::storage::sqlite::SendFrankenConnection::new),
+                );
+            });
+            rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| {
+                Err(frankensqlite::FrankenError::internal(
+                    "database open timed out after 30s (possible corruption or lock contention)",
+                ))
+            })
+        };
+        match db_open_result {
             Ok(conn) => {
                 use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
-
-                // Fix #115: Register the FTS5 virtual table so FrankenSQLite
-                // can see it.  Without this, databases created by stock
-                // rusqlite have rootpage=0 for virtual tables and
-                // FrankenSQLite's sqlite_master parsing silently skips them.
-                if let Err(e) = crate::storage::sqlite::register_fts5_on_connection(&conn) {
-                    tracing::debug!(
-                        error = %e,
-                        "doctor: fts_messages virtual table registration failed (non-fatal)"
-                    );
-                }
 
                 let conv_count: Option<i64> = conn
                     .query_row_map(
@@ -8767,134 +11377,74 @@ fn run_doctor(
                     .ok();
 
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
-                    db_ok = true;
                     db_conversations = Some(conv_count.max(0) as usize);
                     db_messages = Some(msg_count.max(0) as usize);
-                    add_check!(
-                        "database",
-                        "pass",
-                        format!(
-                            "Database OK ({} conversations, {} messages)",
-                            conv_count, msg_count
-                        ),
-                        false
-                    );
+                    let quick_check_status: Option<String> = conn
+                        .query_row_map("PRAGMA quick_check(1)", &[], |r: &frankensqlite::Row| {
+                            r.get_typed(0)
+                        })
+                        .ok();
 
-                    // Check for FTS table (fts_messages) - this can be missing if table was
-                    // dropped after migrations completed.
-                    //
-                    // Fix #116/#117: Do NOT query sqlite_master here.  FrankenSQLite
-                    // filters virtual tables with rootpage=0, which makes the table
-                    // invisible even when it exists.  Instead, probe the table directly
-                    // with a cheap query that will fail with a "no such table" error
-                    // only when the table is genuinely absent.
-                    let fts_exists = conn
-                        .query_row_map(
-                            "SELECT COUNT(*) FROM fts_messages LIMIT 1",
-                            &[],
-                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
-                        )
-                        .is_ok();
+                    match quick_check_status {
+                        Some(status) if status.trim().eq_ignore_ascii_case("ok") => {
+                            db_ok = true;
+                            add_check!(
+                                "database",
+                                "pass",
+                                format!(
+                                    "Database OK ({} conversations, {} messages)",
+                                    conv_count, msg_count
+                                ),
+                                false
+                            );
 
-                    if fts_exists {
-                        add_check!(
-                            "fts_table",
-                            "pass",
-                            "FTS search table (fts_messages) exists",
-                            false
-                        );
-                    } else {
-                        // FTS table missing - attempt to recreate it if --fix is set
-                        if fix {
-                            use frankensqlite::compat::BatchExt as _;
-                            let create_result = (|| -> Result<(), frankensqlite::FrankenError> {
-                                conn.execute_batch(
-                                    r#"
-                                    CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-                                        content,
-                                        title,
-                                        agent,
-                                        workspace,
-                                        source_path,
-                                        created_at UNINDEXED,
-                                        message_id UNINDEXED,
-                                        tokenize='porter'
-                                    );
-                                    "#,
-                                )?;
-
-                                // Batch the INSERT to avoid OOM on large databases (#110)
-                                let total_count: i64 = conn.query_row_map(
-                                    "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id JOIN agents a ON c.agent_id = a.id LEFT JOIN workspaces w ON c.workspace_id = w.id",
-                                    &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
-                                )?;
-                                let batch_size: i64 = 10_000;
-                                let mut offset: i64 = 0;
-
-                                conn.execute_batch("BEGIN;")?;
-                                while offset < total_count {
-                                    info!(
-                                        "Rebuilding FTS: {}/{} rows...",
-                                        offset.min(total_count),
-                                        total_count
-                                    );
-                                    conn.execute_batch(&format!(
-                                        "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                                         SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
-                                         FROM messages m
-                                         JOIN conversations c ON m.conversation_id = c.id
-                                         JOIN agents a ON c.agent_id = a.id
-                                         LEFT JOIN workspaces w ON c.workspace_id = w.id
-                                         ORDER BY m.rowid
-                                         LIMIT {} OFFSET {};",
-                                        batch_size, offset
-                                    ))?;
-                                    offset += batch_size;
-                                }
-                                conn.execute_batch("COMMIT;")?;
-                                info!(
-                                    "Rebuilding FTS: {}/{} rows complete.",
-                                    total_count, total_count
-                                );
-                                Ok(())
-                            })();
-                            match create_result {
-                                Ok(_) => {
-                                    checks.push(Check {
-                                        name: "fts_table".to_string(),
-                                        status: "pass".to_string(),
-                                        message: "FTS search table (fts_messages) recreated"
-                                            .to_string(),
-                                        fix_available: true,
-                                        fix_applied: true,
-                                    });
-                                    auto_fix_actions
-                                        .push("Recreated missing FTS search table".to_string());
-                                    auto_fix_applied = true;
-                                }
-                                Err(e) => {
-                                    // Rollback dangling transaction from failed INSERT loop
-                                    let _ = conn.execute_batch("ROLLBACK;");
+                            // Check whether the FTS table is visible through
+                            // frankensqlite on this connection. Do not auto-register
+                            // it here: on migrated databases with legacy rootpage=0
+                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
+                            // can persist duplicate sqlite_master rows.
+                            match probe_doctor_fts_table(&conn) {
+                                DoctorFtsTableState::QueryableViaFrankensqlite => {
                                     add_check!(
                                         "fts_table",
-                                        "fail",
-                                        format!(
-                                            "FTS table missing and recreation failed: {}. \
-                                             This may indicate the FTS5 module was not registered \
-                                             on this connection (see #115).",
-                                            e
-                                        ),
-                                        true
+                                        "pass",
+                                        "FTS search table (fts_messages) is queryable via frankensqlite",
+                                        false
                                     );
-                                    needs_rebuild = true;
+                                }
+                                DoctorFtsTableState::Missing {
+                                    frankensqlite_error,
+                                } => {
+                                    add_check!(
+                                        "fts_table",
+                                        "pass",
+                                        format!(
+                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                        ),
+                                        false
+                                    );
                                 }
                             }
-                        } else {
+                        }
+                        Some(status) => {
                             add_check!(
-                                "fts_table",
+                                "database",
                                 "fail",
-                                "FTS search table (fts_messages) missing - run with --fix to recreate",
+                                format!(
+                                    "Database failed frankensqlite quick_check: {} ({} conversations, {} messages)",
+                                    status.trim(),
+                                    conv_count,
+                                    msg_count
+                                ),
+                                true
+                            );
+                            needs_rebuild = true;
+                        }
+                        None => {
+                            add_check!(
+                                "database",
+                                "fail",
+                                "Database health probe failed via frankensqlite",
                                 true
                             );
                             needs_rebuild = true;
@@ -9073,25 +11623,19 @@ fn run_doctor(
         );
     }
 
-    // Apply fix: rebuild index if needed
-    if needs_rebuild {
+    // Apply fix: rebuild index if needed (only when --fix is passed)
+    if needs_rebuild && fix {
         let stderr_is_tty = std::io::stderr().is_terminal();
-        let show_progress = !json && stderr_is_tty;
-        let show_plain = !json && !stderr_is_tty;
+        let is_robot = output_format.is_some();
+        let show_progress = !is_robot && stderr_is_tty;
+        let show_plain = !is_robot && !stderr_is_tty;
 
-        if !json {
+        if !is_robot {
             println!();
-            if fix {
-                println!(
-                    "{} Rebuilding index (this may take a moment)...",
-                    "→".cyan()
-                );
-            } else {
-                println!(
-                    "{} Auto-repair: rebuilding index (this may take a moment)...",
-                    "→".cyan()
-                );
-            }
+            println!(
+                "{} Rebuilding index (this may take a moment)...",
+                "→".cyan()
+            );
         }
 
         let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
@@ -9151,33 +11695,51 @@ fn run_doctor(
             // Preserve existing DB when possible; rebuild only derived data.
             let mut can_rebuild = true;
             let mut db_backup_done = false;
-            if db_path.exists() && !db_ok {
+            if !db_ok {
                 let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
                 let backup_path = db_path.with_extension(format!("corrupt.{ts}"));
-                match std::fs::rename(&db_path, &backup_path) {
-                    Ok(_) => {
+                match crate::storage::sqlite::move_database_bundle(&db_path, &backup_path) {
+                    Ok(moved) if moved.moved_any() => {
+                        let mut components = Vec::new();
+                        if moved.database {
+                            components.push("db");
+                        }
+                        if moved.wal {
+                            components.push("wal");
+                        }
+                        if moved.shm {
+                            components.push("shm");
+                        }
+                        let component_note = if components.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", components.join(", "))
+                        };
                         db_backup_done = true;
                         checks.push(Check {
                             name: "database_backup".to_string(),
                             status: "pass".to_string(),
                             message: format!(
-                                "Backed up corrupted database to {}",
-                                backup_path.display()
+                                "Backed up corrupted database bundle to {}{}",
+                                backup_path.display(),
+                                component_note
                             ),
                             fix_available: true,
                             fix_applied: true,
                         });
                         auto_fix_actions.push(format!(
-                            "Backed up corrupted database to {}",
-                            backup_path.display()
+                            "Backed up corrupted database bundle to {}{}",
+                            backup_path.display(),
+                            component_note
                         ));
                         auto_fix_applied = true;
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         checks.push(Check {
                             name: "database_backup".to_string(),
                             status: "fail".to_string(),
-                            message: format!("Failed to backup corrupted database: {}", e),
+                            message: format!("Failed to backup corrupted database bundle: {}", e),
                             fix_available: true,
                             fix_applied: false,
                         });
@@ -9197,7 +11759,10 @@ fn run_doctor(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
-                    full: false,
+                    // When the database is missing or corrupted, doctor must
+                    // rebuild from source sessions using the full path rather
+                    // than the incremental UPSERT-based path.
+                    full: force_rebuild || !db_ok,
                     force_rebuild,
                     watch: false,
                     watch_once_paths: None,
@@ -9207,6 +11772,7 @@ fn run_doctor(
                     build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
+                    watch_interval_secs: 30,
                 };
 
                 let rebuild_handle = std::thread::spawn(move || {
@@ -9278,12 +11844,7 @@ fn run_doctor(
     let all_pass = checks.iter().all(|c| c.status == "pass");
 
     // Output
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -9393,51 +11954,411 @@ fn run_doctor(
     }
 }
 
-/// Find related sessions for a given source path.
-/// Returns sessions that share the same workspace, same day, or same agent.
-fn run_context(
-    path: &Path,
+#[derive(Debug)]
+struct SessionSummaryRecord {
+    agent: String,
+    workspace: Option<PathBuf>,
+    workspace_match_distance: Option<usize>,
+    title: Option<String>,
+    source_path: PathBuf,
+    source_id: String,
+    origin_host: Option<String>,
+    started_at: Option<i64>,
+    modified_at: Option<i64>,
+    size_bytes: Option<u64>,
+    message_count: i64,
+    human_turns: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSummaryEntry {
+    path: String,
+    workspace: Option<String>,
+    agent: String,
+    title: Option<String>,
+    source_id: String,
+    origin_host: Option<String>,
+    modified: Option<String>,
+    size_bytes: Option<u64>,
+    message_count: i64,
+    human_turns: i64,
+}
+
+fn normalize_session_filter_path(path: &Path) -> CliResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| CliError::unknown(format!("current directory: {e}")))?
+            .join(path)
+    };
+    Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+fn workspace_match_distance(candidate: Option<&Path>, target: &Path) -> Option<usize> {
+    let candidate = candidate?;
+    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+
+    if candidate == target {
+        return Some(0);
+    }
+
+    let candidate_depth = candidate.components().count();
+    let target_depth = target.components().count();
+
+    if candidate.starts_with(target) {
+        Some(candidate_depth.saturating_sub(target_depth))
+    } else if target.starts_with(&candidate) {
+        Some(target_depth.saturating_sub(candidate_depth))
+    } else {
+        None
+    }
+}
+
+fn run_sessions(
+    workspace: Option<&PathBuf>,
+    current: bool,
+    limit: Option<usize>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
+    let target_workspace = match (workspace, current) {
+        (Some(path), _) => Some(normalize_session_filter_path(path)?),
+        (None, true) => Some(normalize_session_filter_path(
+            &std::env::current_dir()
+                .map_err(|e| CliError::unknown(format!("current directory: {e}")))?,
+        )?),
+        (None, false) => None,
+    };
+    // Default to 1 only when --current is the actual workspace source
+    // (i.e., no explicit --workspace was provided).
+    let current_determined_workspace = workspace.is_none() && current;
+    let effective_limit = match limit {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None if current_determined_workspace => Some(1),
+        None => Some(10),
+    };
+
+    let params: &[ParamValue] = &[];
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+    )> = conn
+        .query_map_collect(
+            // LEFT JOIN + COALESCE on agents so list_sessions still reports
+            // legacy conversations with NULL agent_id.  GROUP BY must use the
+            // same COALESCE expression so those rows group into a single
+            // 'unknown' bucket.
+            "SELECT COALESCE(a.slug, 'unknown') AS agent_slug,
+                    w.path,
+                    c.title,
+                    c.source_path,
+                    COALESCE(c.source_id, 'local'),
+                    c.origin_host,
+                    s.kind,
+                    c.started_at,
+                    COUNT(m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
+             FROM conversations c
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN messages m ON m.conversation_id = c.id
+             GROUP BY c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
+             ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
+            params,
+            |row: &frankensqlite::Row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                    row.get_typed(7)?,
+                    row.get_typed(8)?,
+                    row.get_typed(9)?,
+                ))
+            },
+        )
+        .map_err(|e| CliError {
+            code: 9,
+            kind: "db-query",
+            message: format!("Failed to list sessions: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+    let mut sessions: Vec<SessionSummaryRecord> = rows
+        .into_iter()
+        .map(
+            |(
+                agent,
+                workspace,
+                title,
+                source_path,
+                source_id,
+                origin_host,
+                origin_kind,
+                started_at,
+                message_count,
+                human_turns,
+            )| {
+                let source_path_buf = PathBuf::from(&source_path);
+                let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
+                let source_id = normalized_provenance_source_id(
+                    source_id.as_str(),
+                    origin_kind.as_deref(),
+                    origin_host.as_deref(),
+                );
+                let metadata = if source_id == crate::sources::provenance::LOCAL_SOURCE_ID {
+                    std::fs::metadata(&source_path_buf).ok()
+                } else {
+                    None
+                };
+                let modified_at = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
+
+                SessionSummaryRecord {
+                    agent,
+                    workspace: workspace.map(PathBuf::from),
+                    workspace_match_distance: None,
+                    title,
+                    source_path: source_path_buf,
+                    source_id,
+                    origin_host,
+                    started_at,
+                    modified_at,
+                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                    message_count,
+                    human_turns,
+                }
+            },
+        )
+        .collect();
+
+    if let Some(target) = target_workspace.as_deref() {
+        for session in &mut sessions {
+            session.workspace_match_distance =
+                workspace_match_distance(session.workspace.as_deref(), target);
+        }
+        sessions.retain(|session| session.workspace_match_distance.is_some());
+    }
+
+    sessions.sort_by(|left, right| {
+        left.workspace_match_distance
+            .unwrap_or(usize::MAX)
+            .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
+            .then_with(|| right.modified_at.cmp(&left.modified_at))
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+
+    if let Some(limit) = effective_limit {
+        sessions.truncate(limit);
+    }
+
+    let entries: Vec<SessionSummaryEntry> = sessions
+        .into_iter()
+        .map(|session| SessionSummaryEntry {
+            path: session.source_path.to_string_lossy().into_owned(),
+            workspace: session
+                .workspace
+                .map(|path| path.to_string_lossy().into_owned()),
+            agent: session.agent,
+            title: session.title,
+            source_id: session.source_id,
+            origin_host: session.origin_host,
+            modified: session.modified_at.and_then(|ts| {
+                chrono::DateTime::<Utc>::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+            }),
+            size_bytes: session.size_bytes,
+            message_count: session.message_count,
+            human_turns: session.human_turns,
+        })
+        .collect();
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let payload = serde_json::json!({ "sessions": entries });
+        return output_structured_value(payload, fmt);
+    }
+
+    if let Some(target) = target_workspace {
+        println!("Sessions for {}", target.display());
+    } else {
+        println!("Recent Sessions");
+    }
+    println!("{}", "─".repeat(72));
+
+    if entries.is_empty() {
+        println!("  No sessions found.");
+        return Ok(());
+    }
+
+    for (idx, session) in entries.iter().enumerate() {
+        let modified = session.modified.as_deref().unwrap_or("-");
+        let workspace = session.workspace.as_deref().unwrap_or("-");
+        let source_label = session
+            .origin_host
+            .as_deref()
+            .unwrap_or(session.source_id.as_str());
+        println!(
+            "{:>2}. [{}] {}  {} msgs / {} human",
+            idx + 1,
+            modified,
+            session.agent,
+            session.message_count,
+            session.human_turns
+        );
+        println!("    workspace: {}", workspace);
+        println!("    source: {}", source_label);
+        println!("    path: {}", session.path);
+    }
+
+    Ok(())
+}
+
+/// Find related sessions for a given source path.
+/// Returns sessions that share the same workspace, same day, or same agent.
+///
+/// The second tuple element (agent_id) is Option<i64> because legacy V1
+/// conversations may have NULL agent_id.  Callers that want to filter by
+/// "same agent" should skip that filter when agent_id is None.
+#[allow(clippy::type_complexity)]
+fn find_context_source_conversation(
+    conn: &frankensqlite::Connection,
+    path_str: &str,
+    source_id: Option<&str>,
+) -> Option<(
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    String,
+    String,
+)> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let source_id = canonical_followup_source_id(source_id);
+    if let Some(source_id) = source_id.as_deref() {
+        // LEFT JOIN + COALESCE on agents: find_context_source_conversation
+        // must return the most-recent matching conversation even if it has a
+        // legacy NULL agent_id (V1 schema).
+        let query = format!(
+            "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, COALESCE(a.slug, 'unknown'), {normalized_source_sql}
+             FROM conversations c
+             LEFT JOIN agents a ON c.agent_id = a.id
+             WHERE c.source_path = ? AND {normalized_source_sql} = ?
+             ORDER BY c.started_at DESC
+             LIMIT 1"
+        );
+        return conn
+            .query_row_map(
+                &query,
+                &[ParamValue::from(path_str), ParamValue::from(source_id)],
+                |r: &frankensqlite::Row| {
+                    Ok((
+                        r.get_typed(0)?,
+                        r.get_typed(1)?,
+                        r.get_typed(2)?,
+                        r.get_typed(3)?,
+                        r.get_typed::<Option<String>>(4)?.unwrap_or_default(),
+                        r.get_typed(5)?,
+                        r.get_typed(6)?,
+                    ))
+                },
+            )
+            .ok();
+    }
+
+    let query = format!(
+        "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, COALESCE(a.slug, 'unknown'), {normalized_source_sql}
+         FROM conversations c
+         LEFT JOIN agents a ON c.agent_id = a.id
+         WHERE c.source_path = ?
+         ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, c.started_at DESC
+         LIMIT 1",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    );
+    conn.query_row_map(
+        &query,
+        &[ParamValue::from(path_str)],
+        |r: &frankensqlite::Row| {
+            Ok((
+                r.get_typed(0)?,
+                r.get_typed(1)?,
+                r.get_typed(2)?,
+                r.get_typed(3)?,
+                r.get_typed::<Option<String>>(4)?.unwrap_or_default(),
+                r.get_typed(5)?,
+                r.get_typed(6)?,
+            ))
+        },
+    )
+    .ok()
+}
+
+fn run_context(
+    path: &Path,
+    source_id: Option<&str>,
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
     limit: usize,
 ) -> CliResult<()> {
     use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass context")?;
+    }
+
     // Find the source conversation by path (normalized to string)
     let path_str = path.to_string_lossy().to_string();
-    #[allow(clippy::type_complexity)]
-    let source_conv: Option<(i64, i64, Option<i64>, Option<i64>, String, String)> = conn
-        .query_row_map(
-            "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, a.slug
-             FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
-             WHERE c.source_path = ?",
-            &[ParamValue::from(path_str.as_str())],
-            |r: &frankensqlite::Row| {
-                Ok((
-                    r.get_typed(0)?,
-                    r.get_typed(1)?,
-                    r.get_typed(2)?,
-                    r.get_typed(3)?,
-                    r.get_typed::<Option<String>>(4)?.unwrap_or_default(),
-                    r.get_typed(5)?,
-                ))
-            },
-        )
-        .ok();
+    let source_conv = find_context_source_conversation(&conn, &path_str, source_id);
 
-    let Some((conv_id, agent_id, workspace_id, started_at, title, agent_slug)) = source_conv else {
+    let Some((conv_id, agent_id, workspace_id, started_at, title, agent_slug, selected_source_id)) =
+        source_conv
+    else {
         return Err(CliError {
             code: 4,
             kind: "not_found",
-            message: format!("No session found at path: {path_str}"),
-            hint: Some(
-                "Use 'cass search' to find sessions, then use the source_path from results."
-                    .to_string(),
-            ),
+            message: match source_id {
+                Some(source_id) => format!("No session found at path: {path_str} for source '{source_id}'"),
+                None => format!("No session found at path: {path_str}"),
+            },
+            hint: Some(match source_id {
+                Some(_) => "Use the exact source_id from search output or omit --source to prefer the local session.".to_string(),
+                None => "Use 'cass search' to find sessions, then use the source_path from results.".to_string(),
+            }),
             retryable: false,
         });
     };
@@ -9452,49 +12373,93 @@ fn run_context(
         .ok()
     });
 
+    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+
     // Find related sessions: same workspace (excluding self)
-    let same_workspace: Vec<(String, String, String, Option<i64>)> =
-        if let Some(ws_id) = workspace_id {
-            conn.query_map_collect(
-                "SELECT c.source_path, c.title, a.slug, c.started_at
+    let same_workspace: Vec<(String, String, String, Option<i64>, String)> = if let Some(ws_id) =
+        workspace_id
+    {
+        let query = format!(
+                "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  WHERE c.workspace_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?",
-                &[
-                    ParamValue::from(ws_id),
-                    ParamValue::from(conv_id),
-                    ParamValue::from(limit as i64),
-                ],
-                |r: &frankensqlite::Row| {
-                    Ok((
-                        r.get_typed(0)?,
-                        r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                        r.get_typed(2)?,
-                        r.get_typed(3)?,
-                    ))
-                },
-            )
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        } else {
-            Vec::new()
-        };
+                 LIMIT ?"
+            );
+        conn.query_map_collect(
+            &query,
+            &[
+                ParamValue::from(ws_id),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
+                Ok((
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
+                    r.get_typed(4)?,
+                ))
+            },
+        )
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    } else {
+        Vec::new()
+    };
 
     // Find related sessions: same day (within 24 hours of started_at)
-    let same_day: Vec<(String, String, String, Option<i64>)> = if let Some(ts) = started_at {
+    let same_day: Vec<(String, String, String, Option<i64>, String)> = if let Some(ts) = started_at
+    {
         let day_start = ts - (ts % 86_400_000); // Start of day in milliseconds
         let day_end = day_start + 86_400_000;
-        conn.query_map_collect(
-            "SELECT c.source_path, c.title, a.slug, c.started_at
+        let query = format!(
+            "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  WHERE c.started_at >= ? AND c.started_at < ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?",
+                 LIMIT ?"
+        );
+        conn.query_map_collect(
+            &query,
             &[
                 ParamValue::from(day_start),
                 ParamValue::from(day_end),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
+                Ok((
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
+                    r.get_typed(4)?,
+                ))
+            },
+        )
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    } else {
+        Vec::new()
+    };
+
+    // Find related sessions: same agent (excluding self).  Skip this lookup
+    // entirely when the source conversation has a NULL agent_id (legacy V1
+    // row) — there's no meaningful "same agent" grouping in that case.
+    let same_agent: Vec<(String, String, Option<i64>, String)> = if let Some(agent_id) = agent_id {
+        let query = format!(
+            "SELECT c.source_path, c.title, c.started_at, {normalized_source_sql}
+                 FROM conversations c
+                 WHERE c.agent_id = ? AND c.id != ?
+                 ORDER BY c.started_at DESC
+                 LIMIT ?"
+        );
+        conn.query_map_collect(
+            &query,
+            &[
+                ParamValue::from(agent_id),
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
@@ -9512,36 +12477,7 @@ fn run_context(
         Vec::new()
     };
 
-    // Find related sessions: same agent (excluding self)
-    let same_agent: Vec<(String, String, Option<i64>)> = {
-        conn.query_map_collect(
-            "SELECT c.source_path, c.title, c.started_at
-                 FROM conversations c
-                 WHERE c.agent_id = ? AND c.id != ?
-                 ORDER BY c.started_at DESC
-                 LIMIT ?",
-            &[
-                ParamValue::from(agent_id),
-                ParamValue::from(conv_id),
-                ParamValue::from(limit as i64),
-            ],
-            |r: &frankensqlite::Row| {
-                Ok((
-                    r.get_typed(0)?,
-                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                    r.get_typed(2)?,
-                ))
-            },
-        )
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-    };
-
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -9557,31 +12493,35 @@ fn run_context(
         let payload = serde_json::json!({
             "source": {
                 "path": path_str,
+                "source_id": selected_source_id,
                 "title": title,
                 "agent": agent_slug,
                 "workspace": workspace_path,
                 "started_at": format_ts(started_at),
             },
             "related": {
-                "same_workspace": same_workspace.iter().map(|(p, t, a, ts)| {
+                "same_workspace": same_workspace.iter().map(|(p, t, a, ts, source_id)| {
                     serde_json::json!({
                         "path": p,
+                        "source_id": source_id,
                         "title": t,
                         "agent": a,
                         "started_at": format_ts(*ts),
                     })
                 }).collect::<Vec<_>>(),
-                "same_day": same_day.iter().map(|(p, t, a, ts)| {
+                "same_day": same_day.iter().map(|(p, t, a, ts, source_id)| {
                     serde_json::json!({
                         "path": p,
+                        "source_id": source_id,
                         "title": t,
                         "agent": a,
                         "started_at": format_ts(*ts),
                     })
                 }).collect::<Vec<_>>(),
-                "same_agent": same_agent.iter().map(|(p, t, ts)| {
+                "same_agent": same_agent.iter().map(|(p, t, ts, source_id)| {
                     serde_json::json!({
                         "path": p,
+                        "source_id": source_id,
                         "title": t,
                         "started_at": format_ts(*ts),
                     })
@@ -9602,6 +12542,7 @@ fn run_context(
     println!("{}", "===============".cyan());
     println!();
     println!("{}: {}", "Source".bold(), path_str);
+    println!("  Source ID: {}", selected_source_id.as_str().magenta());
     println!("  Title: {}", title.as_str().yellow());
     println!("  Agent: {}", agent_slug.as_str().green());
     if let Some(ws) = &workspace_path {
@@ -9620,15 +12561,16 @@ fn run_context(
             "Same Workspace".bold().blue(),
             same_workspace.len()
         );
-        for (path, title_str, agent, timestamp) in &same_workspace {
+        for (path, title_str, agent, timestamp, source_id) in &same_workspace {
             let ts_str = timestamp
                 .and_then(chrono::DateTime::from_timestamp_millis)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
             println!(
-                "  • {} [{}] {}",
+                "  • {} [{} @ {}] {}",
                 title_str.as_str().yellow(),
                 agent.as_str().green(),
+                source_id.as_str().magenta(),
                 ts_str.dimmed()
             );
             println!("    {}", path.as_str().dimmed());
@@ -9638,15 +12580,16 @@ fn run_context(
 
     if !same_day.is_empty() {
         println!("{} ({}):", "Same Day".bold().magenta(), same_day.len());
-        for (path, title_str, agent, timestamp) in &same_day {
+        for (path, title_str, agent, timestamp, source_id) in &same_day {
             let ts_str = timestamp
                 .and_then(chrono::DateTime::from_timestamp_millis)
                 .map(|d| d.format("%H:%M").to_string())
                 .unwrap_or_default();
             println!(
-                "  • {} [{}] {}",
+                "  • {} [{} @ {}] {}",
                 title_str.as_str().yellow(),
                 agent.as_str().green(),
+                source_id.as_str().magenta(),
                 ts_str.dimmed()
             );
             println!("    {}", path.as_str().dimmed());
@@ -9656,12 +12599,17 @@ fn run_context(
 
     if !same_agent.is_empty() {
         println!("{} ({}):", "Same Agent".bold().green(), same_agent.len());
-        for (path, title_str, timestamp) in &same_agent {
+        for (path, title_str, timestamp, source_id) in &same_agent {
             let ts_str = timestamp
                 .and_then(chrono::DateTime::from_timestamp_millis)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
-            println!("  • {} {}", title_str.as_str().yellow(), ts_str.dimmed());
+            println!(
+                "  • {} [{}] {}",
+                title_str.as_str().yellow(),
+                source_id.as_str().magenta(),
+                ts_str.dimmed()
+            );
             println!("    {}", path.as_str().dimmed());
         }
         println!();
@@ -9879,7 +12827,7 @@ fn build_global_flag_schemas() -> Vec<ArgumentSchema> {
 }
 
 /// Discover available features, versions, and limits for agent introspection.
-fn run_capabilities(json: bool) -> CliResult<()> {
+fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
     let response = CapabilitiesResponse {
         crate_version: env!("CARGO_PKG_VERSION").to_string(),
         api_version: 1,
@@ -9917,12 +12865,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
         },
     };
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         // sessions is search-only; for other commands treat it as compact JSON.
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9968,7 +12911,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
 }
 
 /// Full API schema introspection - commands, arguments, and response schemas.
-fn run_introspect(json: bool) -> CliResult<()> {
+fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
     let global_flags = build_global_flag_schemas();
     let commands = build_command_schemas();
     let response_schemas = build_response_schemas();
@@ -9981,12 +12924,7 @@ fn run_introspect(json: bool) -> CliResult<()> {
         response_schemas,
     };
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -10080,7 +13018,7 @@ fn run_config_based_export(
     wizard_state: &crate::pages::wizard::WizardState,
     db_path: &std::path::Path,
     dry_run: bool,
-    json_output: bool,
+    output_format: Option<RobotFormat>,
     _verbose: bool,
 ) -> anyhow::Result<()> {
     use chrono::DateTime;
@@ -10089,13 +13027,13 @@ fn run_config_based_export(
     use std::sync::atomic::AtomicBool;
 
     if dry_run {
-        if json_output {
+        if let Some(fmt) = output_format {
             let result = serde_json::json!({
                 "status": "dry_run",
                 "output_dir": wizard_state.output_dir,
                 "config_valid": true,
             });
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            output_structured_value(result, fmt)?;
         } else {
             println!("Dry run: would export to {:?}", wizard_state.output_dir);
         }
@@ -10144,7 +13082,7 @@ fn run_config_based_export(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Encryption enabled but no password provided"))?;
         let chunk_size = config.encryption.chunk_size.unwrap_or(8 * 1024 * 1024) as usize;
-        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size);
+        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size)?;
         enc_engine.add_password_slot(password)?;
 
         // Add recovery slot if requested
@@ -10157,11 +13095,7 @@ fn run_config_based_export(
         }
 
         // Encrypt the database into the temp encrypted dir
-        let enc_config = enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
-
-        // Write config.json
-        let config_path = encrypted_dir.join("config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&enc_config)?)?;
+        enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
     } else {
         if !wizard_state.unencrypted_confirmed {
             anyhow::bail!(
@@ -10254,7 +13188,15 @@ fn run_config_based_export(
     };
 
     // Output results
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         let result = serde_json::json!({
             "status": "success",
             "output_dir": output_dir,
@@ -10289,7 +13231,13 @@ fn run_config_based_export(
         } else {
             println!("  Encryption: DISABLED (content is public)");
         }
-        println!("  Fingerprint: {}", &bundle_result.fingerprint[..8]);
+        println!(
+            "  Fingerprint: {}",
+            bundle_result
+                .fingerprint
+                .get(..8)
+                .unwrap_or(&bundle_result.fingerprint)
+        );
 
         if let Some(deploy) = deploy_result {
             println!("  Deployment: {}", deploy);
@@ -10300,19 +13248,14 @@ fn run_config_based_export(
 }
 
 /// Show API and contract versions (robot-friendly)
-fn run_api_version(json: bool) -> CliResult<()> {
+fn run_api_version(output_format: Option<RobotFormat>) -> CliResult<()> {
     let payload = serde_json::json!({
         "crate_version": env!("CARGO_PKG_VERSION"),
         "api_version": 1,
         "contract_version": CONTRACT_VERSION,
     });
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -10336,12 +13279,30 @@ fn run_api_version(json: bool) -> CliResult<()> {
 /// Build command schemas for all CLI commands
 fn build_command_schemas() -> Vec<CommandSchema> {
     let root = Cli::command();
+    let global_robot_format = root
+        .get_arguments()
+        .find(|arg| arg.get_id().as_str() == "robot_format");
     root.get_subcommands()
-        .map(command_schema_from_clap)
+        .map(|cmd| command_schema_from_clap(cmd, global_robot_format))
         .collect()
 }
 
-fn command_schema_from_clap(cmd: &Command) -> CommandSchema {
+fn command_schema_from_clap(cmd: &Command, global_robot_format: Option<&Arg>) -> CommandSchema {
+    let mut arguments: Vec<ArgumentSchema> = cmd
+        .get_arguments()
+        .filter(|arg| !should_skip_arg(arg))
+        .map(argument_schema_from_clap)
+        .collect();
+    let has_json_output = cmd
+        .get_arguments()
+        .any(|arg| arg.get_id().as_str() == "json");
+    if has_json_output
+        && let Some(robot_format) = global_robot_format
+        && !arguments.iter().any(|arg| arg.name == "robot-format")
+    {
+        arguments.push(argument_schema_from_clap(robot_format));
+    }
+
     CommandSchema {
         name: cmd.get_name().to_string(),
         description: cmd
@@ -10349,14 +13310,8 @@ fn command_schema_from_clap(cmd: &Command) -> CommandSchema {
             .or_else(|| cmd.get_long_about())
             .map(std::string::ToString::to_string)
             .unwrap_or_default(),
-        arguments: cmd
-            .get_arguments()
-            .filter(|arg| !should_skip_arg(arg))
-            .map(argument_schema_from_clap)
-            .collect(),
-        has_json_output: cmd
-            .get_arguments()
-            .any(|arg| arg.get_id().as_str() == "json"),
+        arguments,
+        has_json_output,
     }
 }
 
@@ -10500,6 +13455,7 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                             "line_number": { "type": ["integer", "null"] },
                             "agent": { "type": "string" },
                             "workspace": { "type": ["string", "null"] },
+                            "workspace_original": { "type": ["string", "null"], "description": "Original workspace path before remote path mapping" },
                             "title": { "type": ["string", "null"] },
                             "content": { "type": ["string", "null"] },
                             "snippet": { "type": ["string", "null"] },
@@ -10627,6 +13583,34 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                     }
                 }
             }
+        }),
+    );
+    schemas.insert(
+        "sessions".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "sessions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "workspace": { "type": ["string", "null"] },
+                            "agent": { "type": "string" },
+                            "title": { "type": ["string", "null"] },
+                            "source_id": { "type": "string" },
+                            "origin_host": { "type": ["string", "null"] },
+                            "modified": { "type": ["string", "null"] },
+                            "size_bytes": { "type": ["integer", "null"] },
+                            "message_count": { "type": "integer" },
+                            "human_turns": { "type": "integer" }
+                        },
+                        "required": ["path", "agent", "source_id", "message_count", "human_turns"]
+                    }
+                }
+            },
+            "required": ["sessions"]
         }),
     );
     schemas.insert(
@@ -10987,50 +13971,346 @@ fn conversation_view_to_raw_messages(
         .collect()
 }
 
-fn try_load_indexed_conversation_from_db(
+fn canonical_followup_source_id(source_id: Option<&str>) -> Option<String> {
+    let trimmed = source_id?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID) {
+        Some(crate::sources::provenance::LOCAL_SOURCE_ID.to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn followup_source_is_local(source_id: Option<&str>) -> bool {
+    canonical_followup_source_id(source_id).as_deref()
+        == Some(crate::sources::provenance::LOCAL_SOURCE_ID)
+}
+
+fn normalized_provenance_origin_host(origin_host: Option<&str>) -> Option<String> {
+    origin_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_provenance_source_id(
+    source_id: &str,
+    origin_kind: Option<&str>,
+    origin_host: Option<&str>,
+) -> String {
+    if let Some(source_id) = canonical_followup_source_id(Some(source_id)) {
+        return source_id;
+    }
+
+    if let Some(host) = normalized_provenance_origin_host(origin_host) {
+        return host;
+    }
+
+    if let Some(kind) = origin_kind.map(str::trim).filter(|value| !value.is_empty())
+        && (kind.eq_ignore_ascii_case("ssh") || kind.eq_ignore_ascii_case("remote"))
+    {
+        return "remote".to_string();
+    }
+
+    crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
+}
+
+fn normalized_provenance_origin_kind(
+    normalized_source_id: &str,
+    origin_kind: Option<&str>,
+) -> String {
+    if let Some(kind) = origin_kind.map(str::trim).filter(|value| !value.is_empty()) {
+        if kind.eq_ignore_ascii_case("local") {
+            return crate::sources::provenance::LOCAL_SOURCE_ID.to_string();
+        }
+        if kind.eq_ignore_ascii_case("ssh") || kind.eq_ignore_ascii_case("remote") {
+            return "remote".to_string();
+        }
+        return kind.to_ascii_lowercase();
+    }
+
+    if followup_source_is_local(Some(normalized_source_id)) {
+        crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
+    } else {
+        "remote".to_string()
+    }
+}
+
+fn normalized_source_identity_sql_expr(source_id_column: &str, origin_host_column: &str) -> String {
+    format!(
+        "CASE WHEN TRIM(COALESCE({source_id_column}, '')) = '' THEN CASE WHEN TRIM(COALESCE({origin_host_column}, '')) = '' THEN '{local}' ELSE TRIM(COALESCE({origin_host_column}, '')) END          WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}'          ELSE TRIM(COALESCE({source_id_column}, '')) END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
+#[cfg(test)]
+fn normalized_source_id_sql_expr(column: &str) -> String {
+    format!(
+        "CASE WHEN TRIM(COALESCE({column}, '')) = '' THEN '{local}'          WHEN LOWER(TRIM(COALESCE({column}, ''))) = '{local}' THEN '{local}'          ELSE TRIM(COALESCE({column}, '')) END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
+fn validate_followup_source_id(source_id: &str, command: &str) -> CliResult<()> {
+    let trimmed = source_id.trim();
+    let keyword = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() || matches!(keyword.as_str(), "all" | "remote") {
+        return Err(CliError {
+            code: 2,
+            kind: "ambiguous-source",
+            message: format!(
+                "{command} requires an exact source_id, not '{source_id}'"
+            ),
+            hint: Some(
+                "Use the source_id field from search results, e.g. --source local or --source work-laptop"
+                    .to_string(),
+            ),
+            retryable: false,
+        });
+    }
+    Ok(())
+}
+
+fn prefers_direct_view_file(path: &Path, source_id: Option<&str>) -> bool {
+    if (!followup_source_is_local(source_id) && source_id.is_some()) || !path.exists() {
+        return false;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("jsonl" | "md" | "markdown" | "txt")
+    )
+}
+
+fn prefers_direct_jsonl_file(path: &Path, source_id: Option<&str>) -> bool {
+    if (!followup_source_is_local(source_id) && source_id.is_some()) || !path.exists() {
+        return false;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("jsonl")
+    )
+}
+
+fn should_defer_indexed_lookup_for_direct_export(path: &Path, source_id: Option<&str>) -> bool {
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    prefers_direct_jsonl_file(path, source_id)
+        || (allow_direct_file
+            && (detect_opencode_sqlite_session(path) || detect_opencode_session(path)))
+}
+
+fn try_load_indexed_conversation_from_db_with_source(
     source_path: &Path,
     db_path: &Path,
+    source_id: Option<&str>,
 ) -> Option<crate::ui::data::ConversationView> {
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::SqliteStorage::open(db_path).ok()?;
-    crate::ui::data::load_conversation(&storage, &source_path.to_string_lossy()).ok()?
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
+    let source_path = source_path.to_string_lossy();
+    let source_id = canonical_followup_source_id(source_id);
+    if let Some(source_id) = source_id.as_deref() {
+        return crate::ui::data::load_conversation_for_source(&storage, source_id, &source_path)
+            .ok()?;
+    }
+    if let Some(local_view) = crate::ui::data::load_conversation_for_source(
+        &storage,
+        crate::sources::provenance::LOCAL_SOURCE_ID,
+        &source_path,
+    )
+    .ok()?
+    {
+        return Some(local_view);
+    }
+    crate::ui::data::load_conversation(&storage, &source_path).ok()?
 }
 
-fn try_load_indexed_conversation(source_path: &Path) -> Option<crate::ui::data::ConversationView> {
-    let db_path = default_db_path();
-    try_load_indexed_conversation_from_db(source_path, &db_path)
+fn serialize_indexed_view_lines(
+    view: &crate::ui::data::ConversationView,
+) -> CliResult<Vec<String>> {
+    conversation_view_to_raw_messages(view)
+        .into_iter()
+        .map(|msg| {
+            serde_json::to_string(&msg).map_err(|e| CliError {
+                code: 9,
+                kind: "serialize-message",
+                message: format!("Failed to serialize indexed message: {e}"),
+                hint: Some(
+                    "The indexed conversation contains unexpected data that could not be re-rendered as JSON."
+                        .into(),
+                ),
+                retryable: false,
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()
 }
 
-fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> CliResult<()> {
+fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let lines: Vec<String> = if path.exists() {
-        let file = File::open(path).map_err(|e| CliError {
+    let file = File::open(path).map_err(|e| CliError {
+        code: 9,
+        kind: "file-open",
+        message: format!("Failed to open file: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    let reader = BufReader::new(file);
+    reader
+        .lines()
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| CliError {
             code: 9,
-            kind: "file-open",
-            message: format!("Failed to open file: {e}"),
-            hint: None,
+            kind: "file_read",
+            message: format!("Failed to read session file: {e}"),
+            hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
+            retryable: false,
+        })
+}
+
+fn parse_followup_jsonl_messages(
+    path: &Path,
+) -> CliResult<(Vec<serde_json::Value>, Option<i64>, Option<i64>)> {
+    let lines = read_followup_file_lines(path)?;
+    let mut messages = Vec::new();
+    let mut session_start = None;
+    let mut session_end = None;
+
+    for (line_number, line) in lines.into_iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg = serde_json::from_str::<serde_json::Value>(&line).map_err(|e| CliError {
+            code: 9,
+            kind: "session-parse",
+            message: format!("Failed to parse session JSONL at line {}: {e}", line_number + 1),
+            hint: Some(
+                "The local JSONL session is malformed; use the indexed copy or repair the session file."
+                    .into(),
+            ),
             retryable: false,
         })?;
-        let reader = BufReader::new(file);
-        reader.lines().map_while(Result::ok).collect()
-    } else if let Some(view) = try_load_indexed_conversation(path) {
-        conversation_view_to_raw_messages(&view)
-            .into_iter()
-            .filter_map(|msg| serde_json::to_string(&msg).ok())
-            .collect()
+        if let Some(ts) = extract_message_timestamp(&msg) {
+            if session_start.is_none_or(|start| ts < start) {
+                session_start = Some(ts);
+            }
+            if session_end.is_none_or(|end| ts > end) {
+                session_end = Some(ts);
+            }
+        }
+        messages.push(msg);
+    }
+
+    Ok((messages, session_start, session_end))
+}
+
+fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
+    let path_str = path.to_string_lossy();
+    let path_lower = path_str.to_ascii_lowercase();
+
+    let agent_name = [
+        (".local/share/opencode", "opencode"),
+        ("sourcegraph.amp", "amp"),
+        (".local/share/amp", "amp"),
+        (".config/gh-copilot", "copilot"),
+        (".config/gh/copilot", "copilot"),
+        ("github-copilot", "copilot"),
+        (".copilot", "copilot"),
+        (".pi/agent", "pi_agent"),
+        (".openclaw", "openclaw"),
+        ("clawdbot", "clawdbot"),
+        ("cline", "cline"),
+        (".aider", "aider"),
+        (".claude", "claude_code"),
+        (".codex", "codex"),
+        ("cursor", "cursor"),
+        (".config/gemini", "gemini"),
+        (".gemini", "gemini"),
+        (".vibe", "vibe"),
+    ]
+    .into_iter()
+    .find_map(|(marker, slug)| path_lower.contains(marker).then(|| slug.to_string()));
+
+    let workspace = path.parent().map(|parent| parent.display().to_string());
+    (agent_name, workspace)
+}
+
+#[cfg(test)]
+fn try_load_indexed_conversation_from_db(
+    source_path: &Path,
+    db_path: &Path,
+) -> Option<crate::ui::data::ConversationView> {
+    try_load_indexed_conversation_from_db_with_source(source_path, db_path, None)
+}
+
+fn run_view(
+    path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: Option<&str>,
+    line: Option<usize>,
+    context: usize,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass view")?;
+    }
+    let normalized_source_id = canonical_followup_source_id(source_id);
+    let source_id = normalized_source_id.as_deref();
+
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let indexed_view = try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id);
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+
+    let prefer_direct_file = prefers_direct_view_file(path, source_id);
+
+    let lines: Vec<String> = if prefer_direct_file {
+        match read_followup_file_lines(path) {
+            Ok(lines) => lines,
+            Err(err) => {
+                if let Some(view) = indexed_view.as_ref() {
+                    serialize_indexed_view_lines(view)?
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    } else if let Some(view) = indexed_view.as_ref() {
+        serialize_indexed_view_lines(view)?
+    } else if allow_direct_file && path.exists() {
+        read_followup_file_lines(path)?
     } else {
         return Err(CliError {
             code: 3,
             kind: "file-not-found",
-            message: format!("File not found: {}", path.display()),
-            hint: Some(
-                "Path may be virtual (e.g. Cursor composer). Re-run index, then use the exact source_path from search output."
-                    .to_string(),
-            ),
+            message: match source_id {
+                Some(source_id) => format!(
+                    "No indexed session found for source '{}' at {}",
+                    source_id,
+                    path.display()
+                ),
+                None => format!("File not found: {}", path.display()),
+            },
+            hint: Some(match source_id {
+                Some(_) => {
+                    "Use the exact source_id from search output or omit --source to prefer the local file/path."
+                        .to_string()
+                }
+                None => {
+                    "Path may be virtual (e.g. Cursor composer). Re-run index, then use the exact source_path from search output."
+                        .to_string()
+                }
+            }),
             retryable: false,
         });
     };
@@ -11047,7 +14327,6 @@ fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> 
 
     let target_line = line.unwrap_or(1);
 
-    // Validate target line is within bounds
     if target_line == 0 {
         return Err(CliError {
             code: 2,
@@ -11074,16 +14353,9 @@ fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> 
 
     let start = target_line.saturating_sub(context + 1);
     let end = (target_line + context).min(lines.len());
-
-    // Only highlight a specific line if -n was explicitly provided
     let highlight_line = line.is_some();
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -11145,27 +14417,22 @@ fn run_index_with_data(
     force_rebuild: bool,
     watch: bool,
     watch_once: Option<Vec<PathBuf>>,
+    watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     build_hnsw: bool,
     embedder: String,
     progress: ProgressResolved,
-    json: bool,
+    output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
 ) -> CliResult<()> {
-    use frankensqlite::Connection;
     use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -11189,42 +14456,45 @@ fn run_index_with_data(
     };
 
     // Check for cached idempotency result
-    if let Some(key) = &idempotency_key
-        && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
-    {
-        // Ensure idempotency_keys table exists
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                key TEXT PRIMARY KEY,
-                params_hash TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            )",
+    if let Some(key) = &idempotency_key {
+        let cached = with_frankensqlite_connection(
+            &db_path,
+            "checking index idempotency cache",
+            |conn| {
+                if let Err(e) = conn.execute(
+                    "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                        key TEXT PRIMARY KEY,
+                        params_hash TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )",
+                ) {
+                    tracing::warn!("Failed to create idempotency_keys table: {e}");
+                }
+
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(e) = conn.execute_compat(
+                    "DELETE FROM idempotency_keys WHERE expires_at < ?1",
+                    frankensqlite::params![now_ms],
+                ) {
+                    tracing::warn!("Failed to clean expired idempotency keys: {e}");
+                }
+
+                let cached: Option<(String, String)> = conn
+                    .query_row_map(
+                        "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
+                        frankensqlite::params![key.as_str(), now_ms],
+                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                    )
+                    .ok();
+                Ok(cached)
+            },
         );
 
-        // Clean expired keys
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = conn.execute_compat(
-            "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-            frankensqlite::params![now_ms],
-        );
-
-        // Look up existing key
-        let cached: Option<(String, String)> = conn
-            .query_row_map(
-                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                frankensqlite::params![key.as_str(), now_ms],
-                |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-            )
-            .ok();
-
-        if let Some((stored_hash, result_json)) = cached {
-            // Verify params match
+        if let Ok(Some((stored_hash, result_json))) = cached {
             if stored_hash == params_hash.to_string() {
-                // Return cached result
                 if let Some(fmt) = structured_format {
-                    // Parse and augment with cached flag
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
                         val["cached"] = serde_json::json!(true);
                         val["idempotency_key"] = serde_json::json!(key);
@@ -11239,7 +14509,6 @@ fn run_index_with_data(
                     return Ok(());
                 }
             } else {
-                // Parameter mismatch - return error
                 return Err(CliError {
                     code: 5,
                     kind: "idempotency_mismatch",
@@ -11248,7 +14517,8 @@ fn run_index_with_data(
                         key
                     ),
                     hint: Some(
-                        "Use a different idempotency key or wait for the existing one to expire (24h)".to_string(),
+                        "Use a different idempotency key or wait for the existing one to expire (24h)"
+                            .to_string(),
                     ),
                     retryable: false,
                 });
@@ -11259,6 +14529,16 @@ fn run_index_with_data(
     let watch_once_paths = watch_once
         .filter(|paths| !paths.is_empty())
         .or_else(read_watch_once_paths_env);
+
+    if let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
+        let err = active_index.to_cli_error();
+        if let Some(fmt) = structured_format {
+            let mut payload = cli_error_json_payload(&err, 0);
+            payload["active_index"] = active_index.to_json();
+            output_structured_value(payload, fmt)?;
+        }
+        return Err(err);
+    }
 
     // Create progress tracker for real-time feedback
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
@@ -11274,6 +14554,7 @@ fn run_index_with_data(
         build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
+        watch_interval_secs: watch_interval,
     };
 
     // Set up progress display
@@ -11293,6 +14574,7 @@ fn run_index_with_data(
     }
 
     let start = Instant::now();
+    let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
 
     // Run indexer in background thread so we can poll progress
     let opts_clone = opts.clone();
@@ -11413,11 +14695,7 @@ fn run_index_with_data(
         let total = index_progress.total.load(Ordering::Relaxed);
         let current = index_progress.current.load(Ordering::Relaxed);
         let agents = index_progress.discovered_agents.load(Ordering::Relaxed);
-        pb.finish_with_message(format!(
-            "Done: {} conversations from {} agent(s)",
-            current.max(total),
-            agents
-        ));
+        progress_completion = Some((pb, current.max(total), agents));
     } else if show_plain {
         // Plain mode: print periodic status updates
         use std::sync::atomic::Ordering;
@@ -11484,21 +14762,21 @@ fn run_index_with_data(
     }
 
     // Get the result from the indexer thread
-    let res = index_handle
-        .join()
-        .map_err(|_| CliError {
-            code: 9,
-            kind: "index",
-            message: "index thread panicked".to_string(),
-            hint: None,
-            retryable: true,
-        })?
-        .map_err(|e| {
+    let mut active_index_error = None::<ActiveIndexRunDetails>;
+    let res = match index_handle.join() {
+        Ok(result) => result.map_err(|e| {
             let chain = e
                 .chain()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(" | ");
+            if error_chain_indicates_active_cass_index(&chain) {
+                let details = active_index_run_details(&data_dir, &db_path)
+                    .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path));
+                let err = details.to_cli_error();
+                active_index_error = Some(details);
+                return err;
+            }
             CliError {
                 code: 9,
                 kind: "index",
@@ -11506,42 +14784,55 @@ fn run_index_with_data(
                 hint: None,
                 retryable: true,
             }
-        });
+        }),
+        Err(_) => Err(CliError {
+            code: 9,
+            kind: "index",
+            message: "index thread panicked".to_string(),
+            hint: None,
+            retryable: true,
+        }),
+    };
+
+    if let Some((pb, conversations, agents)) = progress_completion {
+        match &res {
+            Ok(_) => pb.finish_with_message(format!(
+                "Done: {} conversations from {} agent(s)",
+                conversations, agents
+            )),
+            Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
+        }
+    }
+
     let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
         if let Some(fmt) = structured_format {
-            let payload = serde_json::json!({
-                "success": false,
-                "error": err.message,
-                "elapsed_ms": elapsed_ms,
-            });
+            let mut payload = cli_error_json_payload(err, elapsed_ms);
+            if let Some(active_index) = &active_index_error {
+                payload["active_index"] = active_index.to_json();
+            }
             output_structured_value(payload, fmt)?;
         } else {
-            eprintln!("index debug error: {err:?}");
+            tracing::debug!(?err, "index command failed");
         }
     } else if let Some(fmt) = structured_format {
         // Get stats after successful indexing
         let (conversations, messages) =
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let convs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM conversations",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                let msgs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM messages",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                (convs, msgs)
-            } else {
-                (0, 0)
-            };
+            with_frankensqlite_connection(&db_path, "collecting index result counts", |conn| {
+                let convs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM conversations",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                let msgs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                Ok((convs, msgs))
+            })
+            .unwrap_or((0, 0));
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -11568,15 +14859,22 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
-                let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                let hash_str = params_hash.to_string();
-                let _ = conn.execute_compat(
-                    "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                );
+            if let Err(e) = with_frankensqlite_connection(
+                &db_path,
+                "storing index idempotency result",
+                |conn| {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
+                    let result_json = serde_json::to_string(&payload).unwrap_or_default();
+                    let hash_str = params_hash.to_string();
+                    conn.execute_compat(
+                        "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                    )?;
+                    Ok(())
+                },
+            ) {
+                tracing::warn!("Failed to store idempotency key: {e}");
             }
         }
 
@@ -11619,22 +14917,17 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
         Box::new(BufReader::new(std::fs::File::open(source)?))
     };
 
-    let paths: HashSet<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
+    let mut paths = HashSet::new();
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        paths.insert(trimmed.to_string());
+    }
 
     Ok(paths)
-}
-
-const OWNER: &str = "Dicklesworthstone";
-const REPO: &str = "coding_agent_session_search";
-
-#[derive(Debug, Deserialize)]
-struct ReleaseInfo {
-    tag_name: String,
 }
 
 async fn maybe_prompt_for_update(once: bool) -> Result<()> {
@@ -11647,22 +14940,19 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Use spawn_blocking so the network I/O doesn't block the async worker.
-    // reqwest's async client requires a tokio reactor we no longer have.
-    let update_result = asupersync::runtime::spawn_blocking(latest_release_version_blocking).await;
-
-    let Some((latest_tag, latest_ver)) = update_result else {
+    let Some(update_info) = crate::update_check::check_for_updates(env!("CARGO_PKG_VERSION")).await
+    else {
         return Ok(());
     };
 
-    let current_ver =
-        Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 1, 0));
-    if latest_ver <= current_ver {
+    if !update_info.should_show() {
         return Ok(());
     }
 
     println!(
-        "A newer version is available: current v{current_ver}, latest {latest_tag}. Update now? (y/N): "
+        "A newer version is available: current v{}, latest {}. Update now? (y/N): ",
+        env!("CARGO_PKG_VERSION"),
+        update_info.tag_name
     );
     print!("> ");
     io::stdout().flush().ok();
@@ -11675,76 +14965,8 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
         return Ok(());
     }
 
-    info!(target: "update", "starting self-update to {}", latest_tag);
-    match run_self_update(&latest_tag) {
-        Ok(true) => {
-            println!("Update complete. Please restart cass.");
-            std::process::exit(0);
-        }
-        Ok(false) => {
-            warn!(target: "update", "self-update failed (installer returned error)");
-        }
-        Err(err) => {
-            warn!(target: "update", "self-update failed: {err}");
-        }
-    }
-
-    Ok(())
-}
-
-fn latest_release_version_blocking() -> Option<(String, Version)> {
-    let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("coding-agent-search (update-check)")
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let resp = client.get(url).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let info: ReleaseInfo = resp.json().ok()?;
-    let tag = info.tag_name;
-    let version_str = tag.trim_start_matches('v');
-    let version = Version::parse(version_str).ok()?;
-    Some((tag, version))
-}
-
-#[cfg(windows)]
-fn run_self_update(tag: &str) -> Result<bool> {
-    // Download the install script to a temp file and invoke it with parameters.
-    // Piping irm to iex doesn't support Param() arguments, so we save first.
-    let ps_cmd = format!(
-        "$s = Join-Path $env:TEMP 'cass-install.ps1';          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.ps1' -OutFile $s;          & $s -EasyMode -Verify -Version '{tag}';          Remove-Item -Force $s"
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_cmd])
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
-}
-
-#[cfg(not(windows))]
-fn run_self_update(tag: &str) -> Result<bool> {
-    let sh_cmd = format!(
-        "curl -fsSL https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.sh | bash -s -- --easy-mode --verify --version {tag}"
-    );
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh_cmd)
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
+    info!(target: "update", "starting self-update to {}", update_info.tag_name);
+    crate::update_check::run_self_update(&update_info.tag_name);
 }
 
 // ============================================================================
@@ -11790,6 +15012,92 @@ fn detect_opencode_session(path: &Path) -> bool {
     }
 
     false
+}
+
+/// Detect if a path points to an OpenCode SQLite-backed session.
+///
+/// These paths look like `<prefix>/opencode.db/<url-encoded-session-id>` and are
+/// produced by the OpenCode connector when indexing from the SQLite database.
+/// The actual file at that path does not exist -- the session lives inside
+/// the `.db` file.
+fn detect_opencode_sqlite_session(path: &Path) -> bool {
+    // Walk ancestors looking for a component that ends in ".db"
+    if let Some(parent) = path.parent() {
+        let parent_name = parent
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if parent_name.ends_with(".db") && parent.is_file() {
+            // The parent is a real .db file and the child is the session id
+            return true;
+        }
+    }
+    false
+}
+
+fn path_exists_or_virtual_opencode_sqlite_session(path: &Path, allow_direct_file: bool) -> bool {
+    path.exists() || (allow_direct_file && detect_opencode_sqlite_session(path))
+}
+
+/// Load an OpenCode session from the SQLite database for export.
+///
+/// `path` is expected to be `<dir>/opencode.db/<url-encoded-session-id>`.
+/// Returns (title, start_ts, end_ts, messages as JSON values).
+#[allow(clippy::type_complexity)]
+fn load_opencode_sqlite_session_for_export(
+    path: &Path,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Vec<serde_json::Value>,
+)> {
+    use anyhow::Context;
+
+    let session_id_encoded = path
+        .file_name()
+        .context("missing session id in path")?
+        .to_string_lossy();
+    let session_id =
+        urlencoding::decode(&session_id_encoded).unwrap_or_else(|_| session_id_encoded.clone());
+    let db_path = path.parent().context("missing parent db path")?;
+
+    use franken_agent_detection::connectors::Connector;
+    let connector = franken_agent_detection::OpenCodeConnector::new();
+    let scan_ctx = franken_agent_detection::connectors::ScanContext::local_default(
+        db_path.to_path_buf(),
+        None,
+    );
+    let convs = connector.scan(&scan_ctx)?;
+
+    // Find the conversation matching the session id
+    let conv = convs
+        .into_iter()
+        .find(|c| c.external_id.as_deref() == Some(session_id.as_ref()))
+        .with_context(|| {
+            format!(
+                "session '{}' not found in OpenCode database at {}",
+                session_id,
+                db_path.display()
+            )
+        })?;
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for msg in &conv.messages {
+        let mut msg_json = serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        });
+        if let Some(ts) = msg.created_at {
+            msg_json["timestamp"] = serde_json::Value::from(ts);
+        }
+        if let Some(author) = &msg.author {
+            msg_json["model"] = serde_json::Value::from(author.clone());
+        }
+        messages.push(msg_json);
+    }
+
+    Ok((conv.title, conv.started_at, conv.ended_at, messages))
 }
 
 /// Load an OpenCode session for export.
@@ -11986,23 +15294,676 @@ fn load_opencode_session_for_export(
     Ok((session_title, start, end, sorted_messages))
 }
 
+/// Return value of [`resolve_resume_target`] — the full recipe needed
+/// to resume a session in its native harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeTarget {
+    /// Normalized agent slug (claude, codex, opencode, pi_agent, gemini).
+    agent: &'static str,
+    /// Session identifier extracted from the path or file contents, or
+    /// `None` when the harness resumes by path rather than by id.
+    session_id: Option<String>,
+    /// Fully-resolved argv for the resume command, ready to exec.
+    argv: Vec<String>,
+    /// Why the agent was detected — useful for diagnostics and JSON output.
+    detection_reason: String,
+}
+
+/// POSIX shell escaping for a single argument: wraps in single quotes
+/// and escapes any embedded single quotes. Keeps the output suitable
+/// for `eval "$(cass resume ...)"` without introducing shell injection.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | ',')
+        })
+    {
+        // Safe characters — no quoting needed.
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            // Close quote, emit escaped quote, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Result of agent detection: the normalized slug, an optional
+/// harness-binary hint (currently only meaningful for pi_agent, where
+/// the same slug can correspond to either `pi` or `omp`), and a short
+/// human-readable reason for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedAgent {
+    slug: &'static str,
+    /// Only set when the caller passed an unambiguous alias — e.g.
+    /// `--agent omp` pins the binary to `omp`, while `--agent pi_agent`
+    /// leaves it to the path-based inference inside [`resolve_resume_target`].
+    binary_hint: Option<&'static str>,
+    /// True when the agent was selected via an explicit `--agent`
+    /// override. Used by downstream validators (e.g. the UUID-shape
+    /// check for Claude Code / Codex) to decide whether to enforce
+    /// strict format rules (auto-detection) or trust the user (override).
+    is_override: bool,
+    reason: String,
+}
+
+/// Detect which coding-agent harness owns a given session path.
+///
+/// Detection is path-based and mirrors the layouts that the bundled
+/// connectors understand. If `agent_override` is set, its value is
+/// validated and returned verbatim. Returns a normalized slug plus an
+/// optional binary hint (see [`DetectedAgent::binary_hint`]).
+fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<DetectedAgent> {
+    if let Some(raw) = agent_override {
+        let normalized = raw.trim().to_ascii_lowercase();
+        let (slug, binary_hint): (&'static str, Option<&'static str>) = match normalized.as_str() {
+            "claude" | "claude_code" | "claude-code" => ("claude", None),
+            "codex" => ("codex", None),
+            "opencode" => ("opencode", None),
+            // Generic "pi_agent" / "pi-agent": let path inference pick the binary.
+            "pi_agent" | "pi-agent" => ("pi_agent", None),
+            // pi-mono: user explicitly selected the `pi` binary.
+            "pi" => ("pi_agent", Some("pi")),
+            // Oh My Pi: user explicitly selected the `omp` binary.
+            "omp" | "oh-my-pi" | "ohmypi" | "oh_my_pi" => ("pi_agent", Some("omp")),
+            "gemini" => ("gemini", None),
+            other => {
+                return Err(CliError {
+                    code: 2,
+                    kind: "invalid_agent",
+                    message: format!(
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
+                    ),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+        };
+        return Ok(DetectedAgent {
+            slug,
+            binary_hint,
+            is_override: true,
+            reason: format!("--agent override: {raw}"),
+        });
+    }
+
+    let path_str = path.to_string_lossy();
+    // Path-substring detection. These match the real on-disk layouts
+    // and are ordered longest-match-first where it matters.
+    //
+    // We deliberately only match Claude Code via `.claude/projects`
+    // (the canonical path segment). An earlier draft also matched
+    // `claude_code` anywhere in the path, but that produced false
+    // positives on user directories named things like
+    // `~/projects/my_claude_code_extension/`. Users on unusual installs
+    // can always force detection with `--agent claude`.
+    if path_str.contains(".claude/projects") {
+        return Ok(DetectedAgent {
+            slug: "claude",
+            binary_hint: None,
+            is_override: false,
+            reason: "path contains .claude/projects".to_string(),
+        });
+    }
+    if path_str.contains(".codex/sessions") || path_str.contains("/codex/sessions") {
+        return Ok(DetectedAgent {
+            slug: "codex",
+            binary_hint: None,
+            is_override: false,
+            reason: "path contains .codex/sessions".to_string(),
+        });
+    }
+    if path_str.contains("opencode.db")
+        || path_str.contains(".local/share/opencode")
+        || path_str.contains(".config/opencode")
+    {
+        return Ok(DetectedAgent {
+            slug: "opencode",
+            binary_hint: None,
+            is_override: false,
+            reason: "path references opencode storage".to_string(),
+        });
+    }
+    if path_str.contains(".omp/agent") {
+        return Ok(DetectedAgent {
+            slug: "pi_agent",
+            binary_hint: Some("omp"),
+            is_override: false,
+            reason: "path contains .omp/agent".to_string(),
+        });
+    }
+    if path_str.contains(".pi/agent") {
+        return Ok(DetectedAgent {
+            slug: "pi_agent",
+            binary_hint: Some("pi"),
+            is_override: false,
+            reason: "path contains .pi/agent".to_string(),
+        });
+    }
+    if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
+        return Ok(DetectedAgent {
+            slug: "gemini",
+            binary_hint: None,
+            is_override: false,
+            reason: "path contains gemini storage".to_string(),
+        });
+    }
+
+    Err(CliError {
+        code: 3,
+        kind: "unknown_agent",
+        message: format!(
+            "could not detect the source harness from path '{}'",
+            path.display()
+        ),
+        hint: Some(
+            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini).".into(),
+        ),
+        retryable: false,
+    })
+}
+
+/// Extract a UUID-ish identifier from a session filename.
+///
+/// Strips a single trailing extension (`.jsonl`, `.json`, `.log`, …)
+/// and returns the remaining file stem. For Claude Code and Codex this
+/// IS the session UUID. Returns `None` if the path has no file stem.
+fn extract_filename_session_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Best-effort check that `candidate` looks like a UUID in the canonical
+/// 8-4-4-4-12 hex form (case-insensitive). Both Claude Code and Codex
+/// store sessions at `<dir>/<uuid>.jsonl`, so if we extracted something
+/// that clearly isn't a UUID we can surface a clearer error than the
+/// "session not found" the downstream harness would emit.
+fn looks_like_session_uuid(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if *b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
+///
+/// Pi-agent session files begin with a `{"type":"session", ...}` header
+/// that contains `id` (and often `sessionId`). We scan up to the first
+/// 16 non-empty lines to find it, tolerating blank lines and leading
+/// metadata. Streams line-by-line so large session logs do not get
+/// read into memory in full.
+///
+/// A 1 MiB byte budget caps the total read so a pathologically long
+/// first line (e.g. a JSONL file with no newlines, or a single megabyte
+/// of garbage before the real content) cannot OOM the process. The
+/// session header is always well under this budget in practice.
+fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
+    use std::io::{BufRead as _, Read as _};
+    const MAX_SCAN_BYTES: u64 = 1024 * 1024; // 1 MiB
+    let file = std::fs::File::open(path).map_err(|err| CliError {
+        code: 4,
+        kind: "session_file_unreadable",
+        message: format!(
+            "cannot open pi-agent session file {}: {err}",
+            path.display()
+        ),
+        hint: None,
+        retryable: false,
+    })?;
+    let reader = std::io::BufReader::new(file).take(MAX_SCAN_BYTES);
+    let mut scanned = 0usize;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(err) => {
+                // Stop at the first I/O error — the file may have been
+                // truncated mid-scan, or we hit the MAX_SCAN_BYTES cap
+                // in the middle of a multi-byte UTF-8 sequence. Fall
+                // through to the session-id-not-found error path so
+                // the user gets a clear diagnostic.
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "pi-agent: stopped reading after line I/O error"
+                );
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        scanned += 1;
+        if scanned > 16 {
+            break;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Prefer explicit `sessionId` but fall back to `id` on session-header lines.
+        if let Some(id) = value.get("sessionId").and_then(|v| v.as_str()) {
+            return Ok(id.to_string());
+        }
+        let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type == "session"
+            && let Some(id) = value.get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
+        }
+    }
+    // Deliberately no filename fallback: pi-agent session ids come from
+    // the in-file `{"type":"session","id":"..."}` header, not from the
+    // filename. Synthesizing an id from the filename would produce a
+    // command that looks plausible but `omp --resume` would reject with
+    // a confusing error. Fail explicitly so the user knows what's wrong.
+    Err(CliError {
+        code: 5,
+        kind: "session_id_not_found",
+        message: format!(
+            "no session header found in pi-agent file {} (scanned first 16 non-empty lines)",
+            path.display()
+        ),
+        hint: Some(
+            "Pi-agent session ids live in the `{\"type\":\"session\",\"id\":\"...\"}` header of the JSONL file. If the file is missing its header, invoke `omp --resume <id>` directly with the id you want."
+                .to_string(),
+        ),
+        retryable: false,
+    })
+}
+
+/// Extract an OpenCode session id from a cass-stored source_path.
+///
+/// Cass records OpenCode conversations with
+/// `source_path = <opencode.db>/<url-encoded-session-id>`, so the
+/// session id is the URL-decoded final path component and the parent
+/// directory's name is `opencode.db`. When `strict` is true (the
+/// auto-detection path) we reject anything not matching that shape —
+/// otherwise a random file under `~/.config/opencode` (such as
+/// `config.json`) would produce a plausible-looking but bogus resume
+/// command. When `strict` is false (the `--agent opencode` override)
+/// we trust the caller and only enforce the presence of a non-empty
+/// final component.
+fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
+    let raw = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| CliError {
+            code: 5,
+            kind: "session_id_not_found",
+            message: format!("opencode path has no final component: {}", path.display()),
+            hint: None,
+            retryable: false,
+        })?;
+    if strict {
+        // The parent directory must be the opencode.db virtual folder.
+        // `parent_name` is the last segment of the parent path (already
+        // split by the OS), so a simple equality check is both
+        // sufficient and correct — no need to worry about slashes.
+        let parent_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str());
+        let looks_like_session_path = parent_name == Some("opencode.db");
+        if !looks_like_session_path {
+            return Err(CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!(
+                    "opencode session path must live under an 'opencode.db' directory, got: {}",
+                    path.display()
+                ),
+                hint: Some(
+                    "Expected path shape: '<.../opencode.db>/<session-id>' (as emitted by `cass search` and `cass sessions`). Pass `--agent opencode` to bypass this check if the id is correct."
+                        .into(),
+                ),
+                retryable: false,
+            });
+        }
+    }
+    // Percent-decode the component. urlencoding::decode returns the
+    // original string on pass-through, so this is always non-lossy.
+    let decoded = urlencoding::decode(raw)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|_| raw.to_string());
+    if decoded.is_empty() || decoded == "opencode.db" {
+        return Err(CliError {
+            code: 5,
+            kind: "session_id_not_found",
+            message: format!(
+                "could not extract opencode session id from '{}'",
+                path.display()
+            ),
+            hint: Some(
+                "Expected path shape: '<opencode.db>/<session-id>' (as emitted by cass search)."
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
+    Ok(decoded)
+}
+
+/// Build the ready-to-run resume target for a session path. Does not
+/// touch the filesystem unless the agent requires file-based id
+/// extraction (pi-agent).
+fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult<ResumeTarget> {
+    let detected = detect_resume_agent(path, agent_override)?;
+    let detection_reason = detected.reason;
+    // Skip strict validations (like UUID-shape checks) when the user
+    // passed `--agent ...` — explicit is explicit. We only enforce
+    // strict format rules when detection came from path inference,
+    // because that's the case where cass can meaningfully help the
+    // user catch a "wrong path" mistake.
+    let is_override = detected.is_override;
+
+    match detected.slug {
+        "claude" => {
+            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!(
+                    "cannot derive Claude Code session UUID from '{}'",
+                    path.display()
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+            if !is_override && !looks_like_session_uuid(&uuid) {
+                return Err(CliError {
+                    code: 5,
+                    kind: "session_id_not_found",
+                    message: format!(
+                        "filename stem '{uuid}' does not look like a Claude Code session UUID (expected 8-4-4-4-12 hex)"
+                    ),
+                    hint: Some(
+                        "Did you pass a project directory or notes file instead of a <uuid>.jsonl session file? Pass `--agent claude` to bypass this check if the id is correct."
+                            .into(),
+                    ),
+                    retryable: false,
+                });
+            }
+            Ok(ResumeTarget {
+                agent: "claude",
+                argv: vec!["claude".into(), "--resume".into(), uuid.clone()],
+                session_id: Some(uuid),
+                detection_reason,
+            })
+        }
+        "codex" => {
+            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!("cannot derive Codex session UUID from '{}'", path.display()),
+                hint: None,
+                retryable: false,
+            })?;
+            if !is_override && !looks_like_session_uuid(&uuid) {
+                return Err(CliError {
+                    code: 5,
+                    kind: "session_id_not_found",
+                    message: format!(
+                        "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
+                    ),
+                    hint: Some(
+                        "Did you pass a date directory or log file instead of a <uuid>.jsonl session file? Pass `--agent codex` to bypass this check if the id is correct."
+                            .into(),
+                    ),
+                    retryable: false,
+                });
+            }
+            Ok(ResumeTarget {
+                agent: "codex",
+                argv: vec!["codex".into(), "resume".into(), uuid.clone()],
+                session_id: Some(uuid),
+                detection_reason,
+            })
+        }
+        "opencode" => {
+            // Strict mode only when we auto-detected. An explicit
+            // `--agent opencode` bypasses the parent-directory check.
+            let id = extract_opencode_session_id(path, !is_override)?;
+            Ok(ResumeTarget {
+                agent: "opencode",
+                argv: vec!["opencode".into(), "resume".into(), id.clone()],
+                session_id: Some(id),
+                detection_reason,
+            })
+        }
+        "pi_agent" => {
+            let id = extract_pi_agent_session_id(path)?;
+            // Binary selection precedence:
+            //   1. Explicit override (from `--agent omp` / `--agent pi`).
+            //   2. Path inference (path contains `.omp/agent` → omp).
+            //   3. Fallback to `pi` (pi-mono is the original).
+            let binary = detected.binary_hint.unwrap_or_else(|| {
+                if path.to_string_lossy().contains(".omp/agent") {
+                    "omp"
+                } else {
+                    "pi"
+                }
+            });
+            Ok(ResumeTarget {
+                agent: "pi_agent",
+                argv: vec![binary.into(), "--resume".into(), id.clone()],
+                session_id: Some(id),
+                detection_reason,
+            })
+        }
+        "gemini" => {
+            // Gemini resumes by path rather than by id. Use the
+            // absolute path to avoid cwd ambiguity when `cass resume`
+            // is piped through another process.
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let path_str = canonical.display().to_string();
+            Ok(ResumeTarget {
+                agent: "gemini",
+                argv: vec![
+                    "gemini".into(),
+                    "session".into(),
+                    "restore".into(),
+                    path_str,
+                ],
+                session_id: None,
+                detection_reason,
+            })
+        }
+        // Unreachable: detect_resume_agent validates the slug.
+        other => Err(CliError {
+            code: 3,
+            kind: "unknown_agent",
+            message: format!("internal: unhandled agent slug '{other}'"),
+            hint: None,
+            retryable: false,
+        }),
+    }
+}
+
+/// `cass resume <path>` — resolve and optionally execute the native
+/// harness resume command for a session.
+fn run_resume(
+    path: &Path,
+    agent_override: Option<&str>,
+    exec: bool,
+    shell: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    // Clap enforces mutual exclusion between the local flags `--exec`,
+    // `--shell`, and `--json`, but it cannot see the GLOBAL
+    // `--robot-format` flag from the subcommand's perspective. A user
+    // doing `cass --robot-format json resume --exec /path` would
+    // otherwise silently get structured output with no exec — an
+    // inconsistent experience. Reject the combination explicitly so
+    // the error message matches clap's own conflict errors in spirit.
+    if exec && output_format.is_some() {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message:
+                "`--exec` cannot be combined with structured output (`--robot-format`/`--json`)"
+                    .into(),
+            hint: Some(
+                "Pick one: `--exec` replaces the process with the resume command, structured output prints the plan.".into(),
+            ),
+            retryable: false,
+        });
+    }
+    if shell && output_format.is_some() {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message:
+                "`--shell` cannot be combined with structured output (`--robot-format`/`--json`)"
+                    .into(),
+            hint: Some(
+                "Pick one: `--shell` emits a shell-escaped command line, structured output emits a JSON object.".into(),
+            ),
+            retryable: false,
+        });
+    }
+
+    let target = resolve_resume_target(path, agent_override)?;
+
+    // Output mode precedence (mutually exclusive by construction above):
+    //   1. structured output (`--robot-format json|yaml|msgpack`, `--json`)
+    //   2. `--exec` — replaces the process, side-effectful
+    //   3. `--shell` — single quoted command line
+    //   4. Default — one argv token per line
+    if let Some(fmt) = output_format {
+        let payload = serde_json::json!({
+            "success": true,
+            "agent": target.agent,
+            "session_id": target.session_id,
+            "command": target.argv,
+            "shell_command": target
+                .argv
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+            "detection": target.detection_reason,
+            "path": path.display().to_string(),
+        });
+        output_structured_value(payload, fmt)?;
+        return Ok(());
+    }
+
+    if exec {
+        // Replace the current process with the resume command so the
+        // caller's TTY is handed over to the resumed harness cleanly.
+        let (program, args) = target.argv.split_first().ok_or_else(|| CliError {
+            code: 6,
+            kind: "resume_empty_command",
+            message: "internal: resolved resume command had no program".into(),
+            hint: None,
+            retryable: false,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let err = std::process::Command::new(program).args(args).exec();
+            // `exec` only returns on failure.
+            return Err(CliError {
+                code: 7,
+                kind: "resume_exec_failed",
+                message: format!("failed to exec '{program}': {err}"),
+                hint: Some(format!(
+                    "Verify that '{program}' is installed and on your PATH."
+                )),
+                retryable: false,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let status = std::process::Command::new(program)
+                .args(args)
+                .status()
+                .map_err(|err| CliError {
+                    code: 7,
+                    kind: "resume_exec_failed",
+                    message: format!("failed to spawn '{program}': {err}"),
+                    hint: None,
+                    retryable: false,
+                })?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    if shell {
+        // Single-line shell-quoted command for `eval "$(cass resume ...)"`.
+        let line = target
+            .argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{line}");
+        return Ok(());
+    }
+
+    // Default: one argv token per line. Lets callers either `xargs`
+    // the output or read it into a shell array without extra parsing.
+    for token in &target.argv {
+        println!("{token}");
+    }
+    Ok(())
+}
+
 /// Export a conversation to markdown or other formats
 fn run_export(
     path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: Option<&str>,
     format: ConvExportFormat,
     output: Option<&Path>,
     include_tools: bool,
+    include_skills: bool,
 ) -> CliResult<()> {
     use std::fs::File;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
 
-    let indexed_view = if path.exists() {
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass export")?;
+    }
+    let normalized_source_id = canonical_followup_source_id(source_id);
+    let source_id = normalized_source_id.as_deref();
+
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(path, source_id) {
         None
     } else {
-        try_load_indexed_conversation(path)
+        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id)
     };
 
-    if !path.exists() && indexed_view.is_none() {
+    if source_id.is_none()
+        && !path_exists_or_virtual_opencode_sqlite_session(path, allow_direct_file)
+        && indexed_view.is_none()
+    {
         return Err(CliError {
             code: 3,
             kind: "file-not-found",
@@ -12012,18 +15973,65 @@ fn run_export(
         });
     }
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    let mut session_title: Option<String> = None;
-    let mut session_start: Option<i64> = None;
-    let mut _session_end: Option<i64> = None;
+    let mut messages: Vec<serde_json::Value>;
+    let indexed_title = indexed_view
+        .as_ref()
+        .and_then(|view| view.convo.title.clone());
+    let mut session_title: Option<String> = indexed_title;
+    let session_start: Option<i64>;
+    let mut _session_end: Option<i64>;
+    let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);
 
-    if let Some(view) = indexed_view {
+    if prefer_direct_file {
+        match parse_followup_jsonl_messages(path) {
+            Ok((parsed_messages, parsed_start, parsed_end)) => {
+                messages = parsed_messages;
+                session_start = parsed_start;
+                _session_end = parsed_end;
+            }
+            Err(err) => {
+                if indexed_view.is_none() {
+                    indexed_view = try_load_indexed_conversation_from_db_with_source(
+                        path, &db_path, source_id,
+                    );
+                }
+                if let Some(view) = indexed_view.as_ref() {
+                    session_title = view.convo.title.clone();
+                    session_start = view.convo.started_at;
+                    _session_end = view.convo.ended_at;
+                    messages = conversation_view_to_raw_messages(view);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    } else if let Some(view) = indexed_view.as_ref() {
         session_title = view.convo.title.clone();
         session_start = view.convo.started_at;
         _session_end = view.convo.ended_at;
-        messages = conversation_view_to_raw_messages(&view);
-    } else if detect_opencode_session(path) {
-        // Load OpenCode session using split storage format
+        messages = conversation_view_to_raw_messages(view);
+    } else if allow_direct_file && detect_opencode_sqlite_session(path) {
+        // OpenCode SQLite-backed session: path is db_path/session_id (#149)
+        match load_opencode_sqlite_session_for_export(path) {
+            Ok((title, start, end, msgs)) => {
+                session_title = title;
+                session_start = start;
+                _session_end = end;
+                messages = msgs;
+            }
+            Err(e) => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "opencode-sqlite-parse",
+                    message: format!("Failed to load OpenCode SQLite session: {e}"),
+                    hint: Some(
+                        "Ensure the OpenCode database exists and the session ID is valid".into(),
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+    } else if allow_direct_file && detect_opencode_session(path) {
         match load_opencode_session_for_export(path) {
             Ok((title, start, end, msgs)) => {
                 session_title = title;
@@ -12044,34 +16052,70 @@ fn run_export(
                 });
             }
         }
-    } else {
-        // Standard JSONL format
-        let file = File::open(path).map_err(|e| CliError {
-            code: 9,
-            kind: "file-open",
-            message: format!("Failed to open file: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-
-        let reader = BufReader::new(file);
-
-        for line in reader.lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(ts) = extract_message_timestamp(&msg) {
-                    if session_start.is_none_or(|start| ts < start) {
-                        session_start = Some(ts);
-                    }
-                    if _session_end.is_none_or(|end| ts > end) {
-                        _session_end = Some(ts);
-                    }
-                }
-                messages.push(msg);
-            }
+    } else if allow_direct_file && path.exists() {
+        if prefers_direct_jsonl_file(path, source_id) {
+            let (parsed_messages, parsed_start, parsed_end) = parse_followup_jsonl_messages(path)?;
+            messages = parsed_messages;
+            session_start = parsed_start;
+            _session_end = parsed_end;
+        } else {
+            return Err(CliError {
+                code: 9,
+                kind: "indexed-session-required",
+                message: format!(
+                    "Local export for '{}' requires an indexed conversation or a JSONL/OpenCode session",
+                    path.display()
+                ),
+                hint: Some(
+                    "Run 'cass index --full' first, or export directly from a JSONL/OpenCode session."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
         }
+    } else {
+        return Err(CliError {
+            code: 3,
+            kind: "file-not-found",
+            message: match source_id {
+                Some(source_id) => format!(
+                    "No indexed session found for source '{}' at {}",
+                    source_id,
+                    path.display()
+                ),
+                None => format!("Session file not found: {}", path.display()),
+            },
+            hint: Some(match source_id {
+                Some(_) => {
+                    "Use the exact source_id from search output or omit --source to prefer the local file/path."
+                        .to_string()
+                }
+                None => "Use 'cass search' to find session paths".to_string(),
+            }),
+            retryable: false,
+        });
+    }
+
+    if !include_skills {
+        messages.retain(|msg| {
+            let content = extract_text_content(msg);
+            if content.contains("Base directory for this skill:") {
+                return false;
+            }
+            if content.contains("<system-reminder>") {
+                return false;
+            }
+            if content.contains("The following skills are available for use with the Skill tool:") {
+                return false;
+            }
+            if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                return false;
+            }
+            if content.contains("<!-- skillInjection:") {
+                return false;
+            }
+            true
+        });
     }
 
     if messages.is_empty() {
@@ -12079,7 +16123,9 @@ fn run_export(
             code: 9,
             kind: "empty-session",
             message: format!("No messages found in: {}", path.display()),
-            hint: if detect_opencode_session(path) {
+            hint: if allow_direct_file && detect_opencode_sqlite_session(path) {
+                Some("This path references an OpenCode SQLite session. Use `cass sessions --json` to list available sessions and their exportable paths.".into())
+            } else if allow_direct_file && detect_opencode_session(path) {
                 Some("Check that storage/message/{sessionID}/ contains message files".into())
             } else {
                 None
@@ -12088,7 +16134,6 @@ fn run_export(
         });
     }
 
-    // Find title from first user message (only if no title already set)
     if session_title.is_none() {
         for msg in &messages {
             let role = extract_role(msg);
@@ -12143,6 +16188,8 @@ fn run_export(
 #[allow(clippy::too_many_arguments)]
 fn run_export_html(
     session_path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: Option<&str>,
     output_dir: Option<&Path>,
     filename: Option<&str>,
     encrypt: bool,
@@ -12151,11 +16198,12 @@ fn run_export_html(
     include_tools: bool,
     show_timestamps: bool,
     enable_cdns: bool,
+    include_skills: bool,
     theme: &str,
     dry_run: bool,
     explain: bool,
     open: bool,
-    json_output: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use chrono::TimeZone;
     use html_export::{
@@ -12163,24 +16211,71 @@ fn run_export_html(
         generate_full_filename, get_downloads_dir, is_valid_filename,
     };
     use std::fs::File;
-    use std::io::{self, BufRead, BufReader, Write};
+    use std::io::{self, Write};
 
-    let indexed_view = if session_path.exists() {
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass export-html")?;
+    }
+    let normalized_source_id = canonical_followup_source_id(source_id);
+    let source_id = normalized_source_id.as_deref();
+    let structured_error_output = output_format.or_else(robot_format_from_env).is_some();
+    let emit_structured_error = |err: &CliError| {
+        if structured_error_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": false,
+                    "error": {
+                        "code": err.code,
+                        "kind": err.kind,
+                        "message": err.message,
+                        "hint": err.hint,
+                        "retryable": err.retryable
+                    }
+                })
+            );
+        }
+    };
+
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(session_path, source_id)
+    {
         None
     } else {
-        try_load_indexed_conversation(session_path)
+        try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id)
     };
 
     // --- Validate session exists ---
-    if !session_path.exists() && indexed_view.is_none() {
+    if indexed_view.is_none()
+        && !path_exists_or_virtual_opencode_sqlite_session(session_path, allow_direct_file)
+    {
         let err = CliError {
             code: 3,
             kind: "session_not_found",
-            message: format!("Session file not found: {}", session_path.display()),
-            hint: Some("Use 'cass search' to find session paths".to_string()),
+            message: match source_id {
+                Some(source_id) => format!(
+                    "No indexed session found for source '{}' at {}",
+                    source_id,
+                    session_path.display()
+                ),
+                None => format!("Session file not found: {}", session_path.display()),
+            },
+            hint: Some(match source_id {
+                Some(_) => "Use the exact source_id from search output or omit --source to prefer the local file/path.".to_string(),
+                None => "Use 'cass search' to find session paths".to_string(),
+            }),
             retryable: false,
         };
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -12221,7 +16316,15 @@ fn run_export_html(
                 hint: Some("Use --password <pwd> or --password-stdin".to_string()),
                 retryable: false,
             };
-            if json_output {
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+
+            if let Some(_fmt) = structured_format {
                 println!(
                     "{}",
                     serde_json::json!({
@@ -12243,14 +16346,60 @@ fn run_export_html(
     };
 
     // --- Load session messages ---
-    let mut raw_messages: Vec<serde_json::Value> = Vec::new();
-    let mut session_title: Option<String> = None;
-    let mut session_start: Option<i64> = None;
-    let mut session_end: Option<i64> = None;
-    let mut agent_name: Option<String> = None;
-    let mut workspace: Option<String> = None;
+    let raw_messages: Vec<serde_json::Value>;
+    let indexed_title = indexed_view
+        .as_ref()
+        .and_then(|view| view.convo.title.clone());
+    let indexed_agent_name = indexed_view
+        .as_ref()
+        .map(|view| view.convo.agent_slug.clone());
+    let indexed_workspace = indexed_view.as_ref().and_then(|view| {
+        view.convo
+            .workspace
+            .as_ref()
+            .map(|path| path.display().to_string())
+    });
+    let (path_agent_name, path_workspace) = infer_followup_agent_and_workspace(session_path);
+    let mut session_title: Option<String> = indexed_title;
+    let session_start: Option<i64>;
+    let session_end: Option<i64>;
+    let mut agent_name: Option<String> = indexed_agent_name.or(path_agent_name);
+    let mut workspace: Option<String> = indexed_workspace.or(path_workspace);
+    let prefer_direct_file = prefers_direct_jsonl_file(session_path, source_id);
 
-    if let Some(view) = indexed_view {
+    if prefer_direct_file {
+        match parse_followup_jsonl_messages(session_path) {
+            Ok((parsed_messages, parsed_start, parsed_end)) => {
+                raw_messages = parsed_messages;
+                session_start = parsed_start;
+                session_end = parsed_end;
+            }
+            Err(err) => {
+                if indexed_view.is_none() {
+                    indexed_view = try_load_indexed_conversation_from_db_with_source(
+                        session_path,
+                        &db_path,
+                        source_id,
+                    );
+                }
+                if let Some(view) = indexed_view.as_ref() {
+                    session_title = view.convo.title.clone();
+                    session_start = view.convo.started_at;
+                    session_end = view.convo.ended_at;
+                    agent_name = Some(view.convo.agent_slug.clone());
+                    workspace = view
+                        .convo
+                        .workspace
+                        .as_ref()
+                        .map(|p| p.display().to_string());
+                    raw_messages = conversation_view_to_raw_messages(view);
+                } else {
+                    emit_structured_error(&err);
+                    return Err(err);
+                }
+            }
+        }
+    } else if let Some(view) = indexed_view.as_ref() {
         session_title = view.convo.title.clone();
         session_start = view.convo.started_at;
         session_end = view.convo.ended_at;
@@ -12260,7 +16409,7 @@ fn run_export_html(
             .workspace
             .as_ref()
             .map(|p| p.display().to_string());
-        raw_messages = conversation_view_to_raw_messages(&view);
+        raw_messages = conversation_view_to_raw_messages(view);
     } else {
         // Detect agent from path
         let path_str = session_path.to_string_lossy();
@@ -12282,7 +16431,32 @@ fn run_export_html(
             workspace = Some(parent.display().to_string());
         }
 
-        if detect_opencode_session(session_path) {
+        if allow_direct_file && detect_opencode_sqlite_session(session_path) {
+            // OpenCode SQLite-backed session: path is db_path/session_id (#149)
+            match load_opencode_sqlite_session_for_export(session_path) {
+                Ok((title, start, end, msgs)) => {
+                    session_title = title;
+                    session_start = start;
+                    session_end = end;
+                    raw_messages = msgs;
+                    agent_name = Some("opencode".to_string());
+                }
+                Err(e) => {
+                    let err = CliError {
+                        code: 9,
+                        kind: "opencode_sqlite_parse",
+                        message: format!("Failed to load OpenCode SQLite session: {e}"),
+                        hint: Some(
+                            "Ensure the OpenCode database exists and the session ID is valid"
+                                .into(),
+                        ),
+                        retryable: false,
+                    };
+                    emit_structured_error(&err);
+                    return Err(err);
+                }
+            }
+        } else if allow_direct_file && detect_opencode_session(session_path) {
             match load_opencode_session_for_export(session_path) {
                 Ok((title, start, end, msgs)) => {
                     session_title = title;
@@ -12292,52 +16466,54 @@ fn run_export_html(
                     agent_name = Some("opencode".to_string());
                 }
                 Err(e) => {
-                    return Err(CliError {
+                    let err = CliError {
                         code: 9,
                         kind: "opencode_parse",
                         message: format!("Failed to parse OpenCode session: {e}"),
                         hint: Some("Ensure the session file is valid".into()),
                         retryable: false,
-                    });
+                    };
+                    emit_structured_error(&err);
+                    return Err(err);
                 }
             }
+        } else if prefers_direct_jsonl_file(session_path, source_id) {
+            let (parsed_messages, parsed_start, parsed_end) =
+                parse_followup_jsonl_messages(session_path).inspect_err(|err| {
+                    emit_structured_error(err);
+                })?;
+            raw_messages = parsed_messages;
+            session_start = parsed_start;
+            session_end = parsed_end;
         } else {
-            let file = File::open(session_path).map_err(|e| CliError {
+            let err = CliError {
                 code: 9,
-                kind: "file_open",
-                message: format!("Failed to open file: {e}"),
-                hint: None,
+                kind: "indexed-session-required",
+                message: format!(
+                    "Local export for '{}' requires an indexed conversation or a JSONL/OpenCode session",
+                    session_path.display()
+                ),
+                hint: Some(
+                    "Run 'cass index --full' first, or export directly from a JSONL/OpenCode session."
+                        .to_string(),
+                ),
                 retryable: false,
-            })?;
-
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(ts) = extract_message_timestamp(&msg) {
-                        if session_start.is_none_or(|start| ts < start) {
-                            session_start = Some(ts);
-                        }
-                        if session_end.is_none_or(|end| ts > end) {
-                            session_end = Some(ts);
-                        }
-                    }
-                    raw_messages.push(msg);
-                }
-            }
+            };
+            emit_structured_error(&err);
+            return Err(err);
         }
     }
 
     if raw_messages.is_empty() {
-        return Err(CliError {
+        let err = CliError {
             code: 9,
             kind: "empty_session",
             message: format!("No messages found in: {}", session_path.display()),
             hint: None,
             retryable: false,
-        });
+        };
+        emit_structured_error(&err);
+        return Err(err);
     }
 
     // Find title from first user message
@@ -12382,6 +16558,36 @@ fn run_export_html(
                 content
             };
 
+            // --- Drop entire messages that are skill injections (unless opted in) ---
+            // When Claude Code/Codex/Gemini load a skill, the FULL SKILL.md body is
+            // injected as a user message starting with "Base directory for this skill:".
+            // These are often highly proprietary. DROP THE ENTIRE MESSAGE — don't try
+            // to parse, redact, or pattern-match the content. Just skip it.
+            if !include_skills {
+                if content.contains("Base directory for this skill:") {
+                    return None;
+                }
+                // System reminders contain skill listings, hook metadata, and other
+                // internal context. Drop entire messages that are system-reminder blocks.
+                if content.contains("<system-reminder>") {
+                    return None;
+                }
+                // Skill listing dumps (injected by hooks)
+                if content
+                    .contains("The following skills are available for use with the Skill tool:")
+                {
+                    return None;
+                }
+                // Vercel plugin hook injections with skill metadata
+                if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                    return None;
+                }
+                // Hook injection blocks (contain skill names, patterns, metadata)
+                if content.contains("<!-- skillInjection:") {
+                    return None;
+                }
+            }
+
             // Skip non-message records (queue-operation, summary, etc.)
             // These are internal bookkeeping entries, not actual conversation messages.
             // Only user, assistant, system, tool, and unknown are valid message roles.
@@ -12413,7 +16619,67 @@ fn run_export_html(
         })
         .collect();
 
-    // Store original message count for explain/dry_run modes
+    // Count message types from RAW messages for accuracy.
+    // Must distinguish human-typed prompts from tool results, which both have role "user".
+    // Tool results have content as an array containing {"type": "tool_result", ...} blocks.
+    // Also exclude skill injections from counts when !include_skills, since those messages
+    // are dropped from the rendered output and shouldn't inflate the prompt count.
+    let mut human_turns = 0usize;
+    let mut assistant_msgs = 0usize;
+    let mut tool_use_count = 0usize;
+    for msg in &raw_messages {
+        let role = extract_role(msg);
+        let text = extract_text_content(msg);
+
+        // Skip messages that would be dropped by skill filtering
+        if !include_skills
+            && (text.contains("Base directory for this skill:")
+                || text.contains("<system-reminder>")
+                || text.contains("The following skills are available for use with the Skill tool:")
+                || (text.contains("skillInjection:") && text.contains("matchedSkills"))
+                || text.contains("<!-- skillInjection:"))
+        {
+            continue;
+        }
+
+        match role.as_str() {
+            "user" => {
+                // Check if this is a tool result return or a human-typed message.
+                // Tool results have content as an array with tool_result type blocks.
+                let is_tool_result = msg
+                    .get("message")
+                    .or(Some(msg))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    });
+                if !is_tool_result {
+                    human_turns += 1;
+                }
+            }
+            "assistant" => {
+                assistant_msgs += 1;
+                // Count tool_use blocks within assistant messages
+                if let Some(content) = msg
+                    .get("message")
+                    .or(Some(msg))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    tool_use_count += content
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        })
+                        .count();
+                }
+            }
+            _ => {}
+        }
+    }
     let message_count = messages.len();
 
     // --- Build metadata ---
@@ -12441,6 +16707,9 @@ fn run_export_html(
         }),
         agent: agent_name.clone(),
         message_count,
+        human_turns,
+        assistant_msgs,
+        tool_use_count,
         duration,
         project: workspace.clone(),
     };
@@ -12469,13 +16738,15 @@ fn run_export_html(
     }
 
     if filename.is_some() && !is_valid_filename(&final_filename) {
-        return Err(CliError {
+        let err = CliError {
             code: 4,
             kind: "invalid_filename",
             message: format!("Invalid output filename: {final_filename}"),
             hint: Some("Avoid path separators and reserved characters".to_string()),
             retryable: false,
-        });
+        };
+        emit_structured_error(&err);
+        return Err(err);
     }
 
     let output_path = output_directory.join(final_filename);
@@ -12502,7 +16773,10 @@ fn run_export_html(
             },
             "warnings": []
         });
-        println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12517,7 +16791,10 @@ fn run_export_html(
             "encrypted": encrypt,
             "estimated_size_bytes": estimated_size
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12544,32 +16821,44 @@ fn run_export_html(
 
     let html = exporter
         .export_messages(title, &message_groups, metadata, final_password.as_deref())
-        .map_err(|e| CliError {
-            code: 5,
-            kind: "export_failed",
-            message: format!("Failed to export HTML: {e}"),
-            hint: None,
-            retryable: false,
+        .map_err(|e| {
+            let err = CliError {
+                code: 5,
+                kind: "export_failed",
+                message: format!("Failed to export HTML: {e}"),
+                hint: None,
+                retryable: false,
+            };
+            emit_structured_error(&err);
+            err
         })?;
 
     // --- Write file ---
     std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new("."))).ok();
-    let mut file = File::create(&output_path).map_err(|e| CliError {
-        code: 4,
-        kind: "output_not_writable",
-        message: format!("Could not create output file: {e}"),
-        hint: Some(format!(
-            "Check permissions for {}",
-            output_directory.display()
-        )),
-        retryable: false,
+    let mut file = File::create(&output_path).map_err(|e| {
+        let err = CliError {
+            code: 4,
+            kind: "output_not_writable",
+            message: format!("Could not create output file: {e}"),
+            hint: Some(format!(
+                "Check permissions for {}",
+                output_directory.display()
+            )),
+            retryable: false,
+        };
+        emit_structured_error(&err);
+        err
     })?;
-    file.write_all(html.as_bytes()).map_err(|e| CliError {
-        code: 4,
-        kind: "write_failed",
-        message: format!("Failed to write file: {e}"),
-        hint: None,
-        retryable: false,
+    file.write_all(html.as_bytes()).map_err(|e| {
+        let err = CliError {
+            code: 4,
+            kind: "write_failed",
+            message: format!("Failed to write file: {e}"),
+            hint: None,
+            retryable: false,
+        };
+        emit_structured_error(&err);
+        err
     })?;
 
     let file_size = html.len();
@@ -12595,7 +16884,15 @@ fn run_export_html(
     }
 
     // --- Output result ---
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         let result = serde_json::json!({
             "success": true,
             "exported": {
@@ -12610,13 +16907,23 @@ fn run_export_html(
                 "title": session_title
             }
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
     } else {
         println!("✓ Exported to {}", output_path.display());
         if encrypt {
             println!("  🔒 Encrypted with Web Crypto (AES-256-GCM)");
         }
-        println!("  {} messages, {} bytes", message_count, file_size);
+        if human_turns > 0 {
+            println!(
+                "  {} prompts, {} responses, {} tool uses, {} bytes",
+                human_turns, assistant_msgs, tool_use_count, file_size
+            );
+        } else {
+            println!("  {} messages, {} bytes", message_count, file_size);
+        }
     }
 
     Ok(())
@@ -13193,8 +17500,10 @@ mod opencode_export_tests {
 
 #[cfg(test)]
 mod export_timestamp_tests {
-    use super::extract_message_timestamp;
+    use super::{extract_message_timestamp, run_export_html};
     use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn extract_message_timestamp_parses_multiple_shapes() {
@@ -13219,21 +17528,551 @@ mod export_timestamp_tests {
             Some(1_733_000_123_000)
         );
     }
+
+    #[test]
+    fn export_html_reports_file_read_errors_instead_of_truncating() {
+        let temp = TempDir::new().expect("temp dir");
+        let session_path = temp.path().join("broken-session.jsonl");
+        fs::write(
+            &session_path,
+            b"{\"role\":\"user\",\"content\":\"hello\"}\n\xff\n",
+        )
+        .expect("write invalid session");
+
+        let err = run_export_html(
+            &session_path,
+            None,
+            None,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect_err("invalid utf-8 should fail explicitly");
+
+        assert_eq!(err.kind, "file_read");
+        assert!(
+            err.message.contains("Failed to read session file"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn export_html_accepts_virtual_opencode_sqlite_session_paths() {
+        let temp = TempDir::new().expect("temp dir");
+        let db_path = temp.path().join("opencode.db");
+        fs::write(&db_path, b"not a sqlite db").expect("write placeholder db file");
+        let session_path = db_path.join("session-1");
+
+        let err = run_export_html(
+            &session_path,
+            None,
+            None,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect_err("invalid virtual sqlite session should fail after path acceptance");
+
+        assert_eq!(err.kind, "opencode_sqlite_parse");
+    }
+}
+
+#[cfg(test)]
+mod legacy_source_filter_tests {
+    use super::*;
+    use crate::sources::provenance::SourceFilter;
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use std::path::Path;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_legacy_local_db() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let shared_path = PathBuf::from("/legacy/shared/session.jsonl");
+
+        with_frankensqlite_connection(&db_path, "legacy source test", |conn| {
+            conn.execute("PRAGMA journal_mode = WAL;")?;
+            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);")?;
+            conn.execute(
+                "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT, display_name TEXT);",
+            )?;
+            conn.execute(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT, host_label TEXT);",
+            )?;
+            conn.execute(
+                "CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    agent_id INTEGER NOT NULL,
+                    workspace_id INTEGER,
+                    source_id TEXT,
+                    origin_host TEXT,
+                    title TEXT,
+                    source_path TEXT NOT NULL,
+                    started_at INTEGER,
+                    ended_at INTEGER,
+                    approx_tokens INTEGER,
+                    external_id TEXT,
+                    metadata_json TEXT,
+                    metadata_bin BLOB
+                );",
+            )?;
+            conn.execute(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL,
+                    idx INTEGER,
+                    role TEXT,
+                    created_at INTEGER,
+                    content TEXT
+                );",
+            )?;
+            conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')")?;
+            conn.execute(
+                "INSERT INTO sources(id, kind, host_label) VALUES ('laptop', 'ssh', 'user@laptop')",
+            )?;
+            conn.execute(
+                "INSERT INTO conversations(
+                    id, agent_id, workspace_id, source_id, origin_host, title,
+                    source_path, started_at, ended_at, approx_tokens, external_id,
+                    metadata_json, metadata_bin
+                ) VALUES (
+                    1, 1, NULL, NULL, NULL, 'Local Session',
+                    '/legacy/shared/session.jsonl', 1700000000000, NULL, 10,
+                    'legacy-local', '{}', NULL
+                )",
+            )?;
+            conn.execute(
+                "INSERT INTO conversations(
+                    id, agent_id, workspace_id, source_id, origin_host, title,
+                    source_path, started_at, ended_at, approx_tokens, external_id,
+                    metadata_json, metadata_bin
+                ) VALUES (
+                    2, 1, NULL, 'laptop', 'user@laptop', 'Remote Session',
+                    '/legacy/shared/session.jsonl', 1700000100000, NULL, 10,
+                    'remote-shared', '{}', NULL
+                )",
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
+                 VALUES (1, 1, 0, 'user', 1700000000100, 'local body')",
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
+                 VALUES (2, 2, 0, 'user', 1700000100100, 'remote body')",
+            )?;
+            Ok(())
+        })
+        .expect("create legacy db");
+
+        (tmp, db_path, shared_path)
+    }
+
+    fn open_legacy_local_db_for_update(db_path: &Path) -> frankensqlite::Connection {
+        frankensqlite::Connection::open(db_path.to_string_lossy().to_string())
+            .expect("open writable legacy source test db")
+    }
+
+    #[test]
+    fn source_filter_helpers_use_normalized_source_sql_for_local_semantics() {
+        let normalized_source_sql =
+            normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+
+        let (where_sql, param) = source_filter_where_clause(Some(&SourceFilter::Local));
+        assert_eq!(
+            where_sql,
+            format!(
+                " WHERE {normalized_source_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )
+        );
+        assert!(param.is_none());
+
+        let (where_sql, param) =
+            source_filter_where_clause(Some(&SourceFilter::SourceId("  LOCAL  ".to_string())));
+        assert_eq!(where_sql, format!(" WHERE {normalized_source_sql} = ?"));
+        assert_eq!(param.as_deref(), Some("local"));
+
+        let mut sql = "SELECT 1 WHERE 1=1".to_string();
+        let mut params = Vec::new();
+        append_source_filter_condition(&mut sql, &mut params, &SourceFilter::Remote);
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT 1 WHERE 1=1 AND {normalized_source_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn source_filter_helpers_match_blank_remote_source_id_via_origin_host() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+            .expect("blank remote source_id");
+
+        let (where_sql, param) =
+            source_filter_where_clause(Some(&SourceFilter::SourceId("user@laptop".to_string())));
+        let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
+        let params_vec = vec![param.expect("source id param").into()];
+        let count: i64 = conn
+            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .expect("count blank remote source rows");
+        assert_eq!(count, 1);
+
+        let (where_sql, param) = source_filter_where_clause(Some(&SourceFilter::Remote));
+        assert!(param.is_none());
+        let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
+        let count: i64 = conn
+            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .expect("count remote source rows");
+        assert_eq!(count, 1);
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn source_filter_helpers_match_trimmed_local_source_id_in_db() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+            .expect("update legacy local source_id");
+
+        let (where_sql, param) =
+            source_filter_where_clause(Some(&SourceFilter::SourceId("local".to_string())));
+        let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
+        let params_vec = vec![param.expect("source id param").into()];
+        let count: i64 = conn
+            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .expect("count trimmed local source rows");
+        assert_eq!(count, 1);
+
+        let (where_sql, param) = source_filter_where_clause(Some(&SourceFilter::Local));
+        assert!(param.is_none());
+        let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
+        let count: i64 = conn
+            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .expect("count local source rows");
+        assert_eq!(count, 1);
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn find_context_source_conversation_treats_null_source_as_local() {
+        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+
+        let row =
+            find_context_source_conversation(&conn, &shared_path.to_string_lossy(), Some("local"))
+                .expect("legacy local row should resolve");
+        assert_eq!(row.4, "Local Session");
+        assert_eq!(row.6, "local");
+
+        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+    }
+
+    #[test]
+    fn find_context_source_conversation_normalizes_trimmed_source_id() {
+        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+
+        let row = find_context_source_conversation(
+            &conn,
+            &shared_path.to_string_lossy(),
+            Some("  LOCAL  "),
+        )
+        .expect("trimmed local source should resolve");
+        assert_eq!(row.4, "Local Session");
+        assert_eq!(row.6, "local");
+
+        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+    }
+
+    #[test]
+    fn find_context_source_conversation_matches_blank_remote_source_id_via_origin_host() {
+        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+            .expect("blank remote source_id");
+
+        let row = find_context_source_conversation(
+            &conn,
+            &shared_path.to_string_lossy(),
+            Some("user@laptop"),
+        )
+        .expect("blank remote source should resolve via origin host");
+        assert_eq!(row.4, "Remote Session");
+        assert_eq!(row.6, "user@laptop");
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn find_context_source_conversation_matches_trimmed_local_source_id_in_db() {
+        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+            .expect("update legacy local source_id");
+
+        let row =
+            find_context_source_conversation(&conn, &shared_path.to_string_lossy(), Some("local"))
+                .expect("trimmed local source stored in db should resolve");
+        assert_eq!(row.4, "Local Session");
+        assert_eq!(row.6, "local");
+
+        let preferred =
+            find_context_source_conversation(&conn, &shared_path.to_string_lossy(), None)
+                .expect("path-only lookup should still prefer normalized local row");
+        assert_eq!(preferred.4, "Local Session");
+        assert_eq!(preferred.6, "local");
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn context_and_stats_queries_surface_null_source_id_as_local() {
+        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+
+        let selected =
+            find_context_source_conversation(&conn, &shared_path.to_string_lossy(), None)
+                .expect("shared path should resolve");
+        assert_eq!(selected.4, "Local Session");
+        assert_eq!(selected.6, "local");
+
+        let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
+        let source_sql = format!(
+            "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id)
+             FROM conversations c
+             GROUP BY {normalized_source_sql}
+             ORDER BY source_id"
+        );
+        let source_rows: Vec<(String, i64)> = conn
+            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+                Ok((r.get_typed(0)?, r.get_typed(1)?))
+            })
+            .expect("query source rows");
+        assert!(
+            source_rows
+                .iter()
+                .any(|(source_id, count)| source_id == "local" && *count == 1)
+        );
+        assert!(
+            source_rows
+                .iter()
+                .any(|(source_id, count)| source_id == "laptop" && *count == 1)
+        );
+
+        let timeline_rows: Vec<String> = conn
+            .query_map_collect(
+                "SELECT COALESCE(c.source_id, 'local')
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN messages m ON m.conversation_id = c.id
+                 WHERE c.started_at >= ?1 AND c.started_at <= ?2
+                 GROUP BY c.id
+                 ORDER BY c.started_at DESC",
+                &[1_699_999_999_000_i64.into(), 1_700_000_200_000_i64.into()],
+                |r: &frankensqlite::Row| r.get_typed(0),
+            )
+            .expect("query timeline rows");
+        assert!(timeline_rows.iter().any(|source_id| source_id == "local"));
+
+        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+    }
+
+    #[test]
+    fn stats_source_grouping_uses_origin_host_when_remote_source_id_blank() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+            .expect("blank remote source_id");
+
+        let normalized_source_sql =
+            normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+        let source_sql = format!(
+            "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id)
+             FROM conversations c
+             GROUP BY {normalized_source_sql}
+             ORDER BY source_id"
+        );
+        let source_rows: Vec<(String, i64)> = conn
+            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+                Ok((r.get_typed(0)?, r.get_typed(1)?))
+            })
+            .expect("query normalized source rows");
+
+        assert!(
+            source_rows
+                .iter()
+                .any(|(source_id, count)| source_id == "user@laptop" && *count == 1),
+            "expected blank remote source to group under origin host, got: {source_rows:?}"
+        );
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn stats_source_grouping_normalizes_trimmed_local_source_id_in_db() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+            .expect("update legacy local source_id");
+
+        let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
+        let source_sql = format!(
+            "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id)
+             FROM conversations c
+             GROUP BY {normalized_source_sql}
+             ORDER BY source_id"
+        );
+        let source_rows: Vec<(String, i64)> = conn
+            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+                Ok((r.get_typed(0)?, r.get_typed(1)?))
+            })
+            .expect("query normalized source rows");
+
+        assert!(
+            source_rows
+                .iter()
+                .any(|(source_id, count)| source_id == "local" && *count == 1),
+            "expected trimmed local source to group under local, got: {source_rows:?}"
+        );
+        assert!(
+            !source_rows
+                .iter()
+                .any(|(source_id, _)| source_id.trim() != source_id || source_id.is_empty()),
+            "expected no raw trimmed/blank source ids, got: {source_rows:?}"
+        );
+
+        conn.close().expect("close writable legacy source test db");
+    }
 }
 
 #[cfg(test)]
 mod indexed_conversation_fallback_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::sources::provenance::{Source, SourceKind};
     use crate::storage::sqlite::SqliteStorage;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
+    fn prefer_direct_helpers_allow_explicit_local_source() {
+        let tmp = TempDir::new().expect("temp dir");
+        let jsonl = tmp.path().join("session.jsonl");
+        let markdown = tmp.path().join("session.md");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write jsonl");
+        std::fs::write(&markdown, "# heading\nbody\n").expect("write markdown");
+
+        assert!(prefers_direct_view_file(
+            &jsonl,
+            Some(crate::sources::provenance::LOCAL_SOURCE_ID)
+        ));
+        assert!(prefers_direct_view_file(
+            &markdown,
+            Some(crate::sources::provenance::LOCAL_SOURCE_ID)
+        ));
+        assert!(prefers_direct_jsonl_file(
+            &jsonl,
+            Some(crate::sources::provenance::LOCAL_SOURCE_ID)
+        ));
+    }
+
+    #[test]
+    fn prefer_direct_helpers_allow_trimmed_explicit_local_source() {
+        let tmp = TempDir::new().expect("temp dir");
+        let jsonl = tmp.path().join("session.jsonl");
+        let markdown = tmp.path().join("session.md");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write jsonl");
+        std::fs::write(&markdown, "# heading\nbody\n").expect("write markdown");
+
+        assert!(prefers_direct_view_file(&jsonl, Some("  local  ")));
+        assert!(prefers_direct_view_file(&markdown, Some("\tlocal\n")));
+        assert!(prefers_direct_jsonl_file(&jsonl, Some("  LOCAL  ")));
+        assert!(followup_source_is_local(Some("  local  ")));
+        assert_eq!(
+            canonical_followup_source_id(Some("\tLOCAL\n")).as_deref(),
+            Some(crate::sources::provenance::LOCAL_SOURCE_ID)
+        );
+    }
+
+    #[test]
+    fn defer_index_lookup_for_direct_opencode_and_jsonl_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let jsonl = tmp.path().join("session.jsonl");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write jsonl");
+
+        let opencode_db = tmp.path().join("opencode.db");
+        std::fs::write(&opencode_db, b"placeholder").expect("write db");
+        let virtual_session = opencode_db.join("session-1");
+
+        assert!(should_defer_indexed_lookup_for_direct_export(&jsonl, None));
+        assert!(should_defer_indexed_lookup_for_direct_export(
+            &virtual_session,
+            None
+        ));
+        assert!(!should_defer_indexed_lookup_for_direct_export(
+            Path::new("/missing/indexed/session.jsonl"),
+            Some("work-laptop")
+        ));
+    }
+
+    #[test]
+    fn validate_followup_source_id_rejects_trimmed_ambiguous_keywords() {
+        for input in ["  ", "  all  ", "\tREMOTE\n"] {
+            let err = validate_followup_source_id(input, "cass view")
+                .expect_err("ambiguous keyword should be rejected");
+            assert_eq!(err.kind, "ambiguous-source");
+            assert!(err.message.contains(input));
+        }
+    }
+
+    #[test]
+    fn prefer_direct_helpers_reject_non_local_sources() {
+        let tmp = TempDir::new().expect("temp dir");
+        let jsonl = tmp.path().join("session.jsonl");
+        let markdown = tmp.path().join("session.md");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write jsonl");
+        std::fs::write(&markdown, "# heading\nbody\n").expect("write markdown");
+
+        assert!(!prefers_direct_view_file(&jsonl, Some("work-laptop")));
+        assert!(!prefers_direct_view_file(&markdown, Some("work-laptop")));
+        assert!(!prefers_direct_jsonl_file(&jsonl, Some("work-laptop")));
+    }
+
+    #[test]
     fn db_fallback_loads_virtual_source_path_and_converts_messages() {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("agent_search.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("open sqlite");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
 
         let agent = Agent {
             id: None,
@@ -13288,6 +18127,1456 @@ mod indexed_conversation_fallback_tests {
             extract_message_timestamp(&raw_messages[0]),
             Some(1_733_000_000_000)
         );
+    }
+
+    #[test]
+    fn try_load_indexed_conversation_from_db_prefers_local_source_for_shared_path() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::storage::sqlite::FrankenStorage;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent = Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+        storage
+            .upsert_source(&Source {
+                id: "work-laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("work-laptop".to_string()),
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .expect("insert remote source");
+        let synthetic_path = PathBuf::from("/same/path/session.jsonl");
+
+        let remote = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("remote-123".to_string()),
+            title: Some("Remote Session".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("remote".to_string()),
+                created_at: Some(1_700_000_000_001),
+                content: "remote body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "work-laptop".to_string(),
+            origin_host: Some("work-laptop".to_string()),
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &remote)
+            .expect("insert remote conversation");
+
+        let local = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("local-123".to_string()),
+            title: Some("Local Session".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_100_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("local".to_string()),
+                created_at: Some(1_700_000_100_001),
+                content: "local body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &local)
+            .expect("insert local conversation");
+
+        let loaded = try_load_indexed_conversation_from_db(&synthetic_path, &db_path)
+            .expect("conversation should load via db fallback");
+        assert_eq!(
+            loaded.convo.source_id,
+            crate::sources::provenance::LOCAL_SOURCE_ID
+        );
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("local-123"));
+        assert_eq!(loaded.messages[0].content, "local body");
+    }
+
+    #[test]
+    fn try_load_indexed_conversation_from_db_falls_back_to_remote_when_local_missing() {
+        use crate::storage::sqlite::FrankenStorage;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent = Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+        storage
+            .upsert_source(&Source {
+                id: "work-laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("work-laptop".to_string()),
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .expect("insert remote source");
+        let synthetic_path = PathBuf::from("/same/path/remote-only.jsonl");
+
+        let remote = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("remote-only".to_string()),
+            title: Some("Remote Only".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("remote".to_string()),
+                created_at: Some(1_700_000_000_001),
+                content: "remote-only body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "work-laptop".to_string(),
+            origin_host: Some("work-laptop".to_string()),
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &remote)
+            .expect("insert remote conversation");
+
+        let loaded = try_load_indexed_conversation_from_db(&synthetic_path, &db_path)
+            .expect("conversation should load via db fallback");
+        assert_eq!(loaded.convo.source_id, "work-laptop");
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("remote-only"));
+        assert_eq!(loaded.messages[0].content, "remote-only body");
+    }
+
+    #[test]
+    fn run_export_uses_exact_source_id_for_shared_indexed_path() {
+        use crate::storage::sqlite::FrankenStorage;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent = Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+        storage
+            .upsert_source(&Source {
+                id: "work-laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("work-laptop".to_string()),
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .expect("insert remote source");
+        let synthetic_path = PathBuf::from("/same/path/export.jsonl");
+
+        let local = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("local-export".to_string()),
+            title: Some("Local Export".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_100_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("local".to_string()),
+                created_at: Some(1_700_000_100_001),
+                content: "local export body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &local)
+            .expect("insert local conversation");
+
+        let remote = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("remote-export".to_string()),
+            title: Some("Remote Export".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("remote".to_string()),
+                created_at: Some(1_700_000_000_001),
+                content: "remote export body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "work-laptop".to_string(),
+            origin_host: Some("work-laptop".to_string()),
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &remote)
+            .expect("insert remote conversation");
+
+        let output_path = tmp.path().join("export.md");
+        run_export(
+            &synthetic_path,
+            Some(db_path.clone()),
+            Some("work-laptop"),
+            ConvExportFormat::Markdown,
+            Some(output_path.as_path()),
+            false,
+            true,
+        )
+        .expect("run export");
+
+        let markdown = std::fs::read_to_string(&output_path).expect("read markdown");
+        assert!(markdown.contains("remote export body"));
+        assert!(!markdown.contains("local export body"));
+    }
+
+    #[test]
+    fn run_export_prefers_local_jsonl_file_when_no_source_is_given() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"local first"}
+{"role":"assistant","content":"local second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("stale-index".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed only line".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_path = tmp.path().join("export.md");
+        run_export(
+            &session_path,
+            Some(db_path),
+            None,
+            ConvExportFormat::Markdown,
+            Some(output_path.as_path()),
+            false,
+            true,
+        )
+        .expect("export should prefer the local JSONL file over stale indexed content");
+
+        let markdown = std::fs::read_to_string(&output_path).expect("read markdown");
+        assert!(markdown.contains("local second"));
+        assert!(!markdown.contains("indexed only line"));
+        // When the direct JSONL file is available and no source_id is
+        // supplied, the indexed DB lookup is intentionally deferred
+        // (should_defer_indexed_lookup_for_direct_export returns true for
+        // .jsonl files).  The exported title is therefore derived from the
+        // session path, not from the indexed conversation.
+        assert!(!markdown.contains("indexed only line"));
+    }
+
+    #[test]
+    fn run_export_html_prefers_local_jsonl_file_when_no_source_is_given() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"local first"}
+{"role":"assistant","content":"local second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("stale-index".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed only line".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("mkdir html-out");
+        run_export_html(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("export.html"),
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect("html export should prefer the local JSONL file over stale indexed content");
+
+        let html_path = output_dir.join("export.html");
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("local second"));
+        assert!(!html.contains("indexed only line"));
+        // Agent and workspace metadata come from the indexed DB lookup,
+        // which is deferred for direct .jsonl files without a source_id.
+        // The HTML export still succeeds with content from the local file.
+    }
+
+    #[test]
+    fn run_export_html_infers_metadata_for_local_jsonl_without_index() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("missing.db");
+        let session_path = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("demo")
+            .join("session.jsonl");
+        std::fs::create_dir_all(session_path.parent().expect("session parent")).expect("mkdirs");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"local first"}
+{"role":"assistant","content":"local second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("mkdir html-out");
+        run_export_html(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("export.html"),
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect(
+            "html export should infer metadata from the local session path when no index exists",
+        );
+
+        let html_path = output_dir.join("export.html");
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("Claude"));
+        assert!(html.contains("demo"));
+        assert!(html.contains("local second"));
+    }
+
+    #[test]
+    fn run_export_html_infers_copilot_metadata_for_local_jsonl_without_index() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("missing.db");
+        let session_path = tmp
+            .path()
+            .join(".config")
+            .join("gh-copilot")
+            .join("sessions")
+            .join("session.jsonl");
+        std::fs::create_dir_all(session_path.parent().expect("session parent")).expect("mkdirs");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"copilot first"}
+{"role":"assistant","content":"copilot second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("mkdir html-out");
+        run_export_html(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("export.html"),
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect("html export should infer copilot metadata from the local session path");
+
+        let html_path = output_dir.join("export.html");
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("GitHub Copilot"));
+        assert!(html.contains("sessions"));
+        assert!(html.contains("copilot second"));
+    }
+
+    #[test]
+    fn run_view_prefers_local_jsonl_file_when_no_source_is_given() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"local first"}
+{"role":"assistant","content":"local second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("stale-index".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed only line".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_view(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(2),
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("view should prefer the local JSONL file over stale indexed content");
+    }
+
+    #[test]
+    fn run_view_prefers_local_markdown_file_when_no_source_is_given() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "aider".to_string(),
+            name: "Aider".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.md");
+        std::fs::write(
+            &session_path,
+            "# local heading
+local second line
+",
+        )
+        .expect("write markdown");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "aider".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("stale-index".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed only line".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_view(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(2),
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("view should prefer the local markdown file over stale indexed content");
+    }
+
+    #[test]
+    fn run_expand_prefers_local_jsonl_file_when_no_source_is_given() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            br#"{"role":"user","content":"local first"}
+{"role":"assistant","content":"local second"}
+"#,
+        )
+        .expect("write jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("stale-index".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed only line".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_expand(
+            &session_path,
+            Some(db_path),
+            None,
+            2,
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("expand should prefer the local JSONL file over stale indexed content");
+    }
+
+    #[test]
+    fn run_expand_prefers_indexed_conversation_for_local_markdown_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "aider".to_string(),
+            name: "Aider".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("session.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+This is not JSONL.
+",
+        )
+        .expect("write markdown");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "aider".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("indexed-md".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("me".to_string()),
+                    created_at: Some(1_733_000_000_000),
+                    content: "indexed first line".to_string(),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".to_string()),
+                    created_at: Some(1_733_000_001_000),
+                    content: "indexed second line".to_string(),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_expand(
+            &session_path,
+            Some(db_path),
+            None,
+            2,
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("expand should use indexed conversation data for local markdown-backed sessions");
+    }
+
+    #[test]
+    fn run_expand_requires_indexed_conversation_for_local_markdown_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("missing.db");
+        let session_path = tmp.path().join("session.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+This is not JSONL.
+",
+        )
+        .expect("write markdown");
+
+        let err = run_expand(
+            &session_path,
+            Some(db_path),
+            None,
+            1,
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect_err(
+            "expand should require the indexed conversation for local markdown-backed sessions",
+        );
+
+        assert_eq!(err.kind, "indexed-session-required");
+    }
+
+    #[test]
+    fn run_export_falls_back_to_indexed_conversation_when_local_jsonl_is_invalid() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("broken-session.jsonl");
+        std::fs::write(&session_path, b"this is not valid jsonl\n").expect("write invalid jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("indexed-fallback".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed markdown fallback".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_path = tmp.path().join("export.md");
+        run_export(
+            &session_path,
+            Some(db_path),
+            None,
+            ConvExportFormat::Markdown,
+            Some(output_path.as_path()),
+            false,
+            true,
+        )
+        .expect("export should fall back to indexed content when the local JSONL is invalid");
+
+        let markdown = std::fs::read_to_string(&output_path).expect("read markdown");
+        assert!(markdown.contains("indexed markdown fallback"));
+    }
+
+    #[test]
+    fn run_export_keeps_index_for_local_markdown_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "aider".to_string(),
+            name: "Aider".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("aider-session.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+This should stay behind the indexed export.
+",
+        )
+        .expect("write aider markdown");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "aider".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("aider-indexed".to_string()),
+            title: Some("Aider Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed aider markdown body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_path = tmp.path().join("export.md");
+        run_export(
+            &session_path,
+            Some(db_path),
+            None,
+            ConvExportFormat::Markdown,
+            Some(output_path.as_path()),
+            false,
+            true,
+        )
+        .expect("export should prefer indexed content for local markdown-backed sessions");
+
+        let markdown = std::fs::read_to_string(&output_path).expect("read markdown");
+        assert!(markdown.contains("indexed aider markdown body"));
+        assert!(
+            !markdown.contains("This should stay behind the indexed export"),
+            "local raw markdown should not bypass indexed export rendering"
+        );
+    }
+
+    #[test]
+    fn run_export_html_falls_back_to_indexed_conversation_when_local_jsonl_is_invalid() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("broken-session-html.jsonl");
+        std::fs::write(&session_path, b"this is not valid jsonl\n").expect("write invalid jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("indexed-fallback".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed html fallback".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("mkdir html-out");
+        run_export_html(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("export.html"),
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect("html export should fall back to indexed content when the local JSONL is invalid");
+
+        let html_path = output_dir.join("export.html");
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("indexed html fallback"));
+    }
+
+    #[test]
+    fn run_export_html_keeps_index_for_local_markdown_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "aider".to_string(),
+            name: "Aider".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("aider-session-html.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+This should stay behind the indexed html export.
+",
+        )
+        .expect("write aider markdown");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "aider".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("aider-indexed-html".to_string()),
+            title: Some("Aider Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed aider html body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("mkdir html-out");
+        run_export_html(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("export.html"),
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect("html export should prefer indexed content for local markdown-backed sessions");
+
+        let html_path = output_dir.join("export.html");
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("indexed aider html body"));
+        assert!(
+            !html.contains("This should stay behind the indexed html export"),
+            "local raw markdown should not bypass indexed html export rendering"
+        );
+    }
+
+    #[test]
+    fn run_view_falls_back_to_indexed_conversation_when_local_jsonl_is_unreadable() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("unreadable-session.jsonl");
+        std::fs::write(&session_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8 jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("indexed-fallback".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed view fallback".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_view(
+            &session_path,
+            Some(db_path),
+            None,
+            Some(1),
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("view should fall back to indexed content when the local JSONL cannot be read");
+    }
+
+    #[test]
+    fn run_expand_falls_back_to_indexed_conversation_when_local_jsonl_is_unreadable() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let session_path = tmp.path().join("unreadable-expand.jsonl");
+        std::fs::write(&session_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8 jsonl");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("indexed-fallback".to_string()),
+            title: Some("Indexed Session".to_string()),
+            source_path: session_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "indexed expand fallback".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_expand(
+            &session_path,
+            Some(db_path),
+            None,
+            1,
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("expand should fall back to indexed content when the local JSONL cannot be read");
+    }
+
+    #[test]
+    fn run_view_prefers_indexed_conversation_over_local_backing_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "cursor".to_string(),
+            name: "Cursor".to_string(),
+            version: None,
+            kind: AgentKind::VsCode,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let synthetic_path = tmp.path().join("Cursor/globalStorage/state.vscdb");
+        std::fs::create_dir_all(synthetic_path.parent().expect("parent")).expect("mkdirs");
+        std::fs::write(&synthetic_path, [0xff, 0xfe, 0xfd]).expect("write invalid backing file");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "cursor".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("composer-123".to_string()),
+            title: Some("Cursor synthetic path".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "hello from cursor".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_view(
+            &synthetic_path,
+            Some(db_path),
+            None,
+            Some(1),
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("view should prefer indexed conversation over unreadable backing file");
+    }
+
+    #[test]
+    fn run_expand_prefers_indexed_conversation_over_local_backing_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+
+        let agent = Agent {
+            id: None,
+            slug: "cursor".to_string(),
+            name: "Cursor".to_string(),
+            version: None,
+            kind: AgentKind::VsCode,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+
+        let synthetic_path = tmp.path().join("Cursor/globalStorage/state.vscdb");
+        std::fs::create_dir_all(synthetic_path.parent().expect("parent")).expect("mkdirs");
+        std::fs::write(&synthetic_path, [0xff, 0xfe, 0xfd]).expect("write invalid backing file");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "cursor".to_string(),
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            external_id: Some("composer-123".to_string()),
+            title: Some("Cursor synthetic path".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_010_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("me".to_string()),
+                created_at: Some(1_733_000_000_000),
+                content: "hello from cursor".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+
+        run_expand(
+            &synthetic_path,
+            Some(db_path),
+            None,
+            1,
+            0,
+            Some(RobotFormat::Json),
+        )
+        .expect("expand should prefer indexed conversation over unreadable backing file");
+    }
+}
+
+#[cfg(test)]
+mod robot_output_score_tests {
+    use super::{
+        filter_hit_fields, normalized_robot_hit_for_output, projected_hit_field_value,
+        safe_robot_score_value,
+    };
+    use crate::search::query::{MatchType, SearchHit};
+
+    fn test_hit(score: f32) -> SearchHit {
+        SearchHit {
+            title: "Title".to_string(),
+            snippet: "Snippet".to_string(),
+            content: "Content".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score,
+            source_path: "/tmp/session.jsonl".to_string(),
+            agent: "codex".to_string(),
+            workspace: "/tmp".to_string(),
+            workspace_original: None,
+            created_at: Some(1_733_000_000_000),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        }
+    }
+
+    #[test]
+    fn safe_robot_score_value_coerces_non_finite_scores() {
+        assert_eq!(safe_robot_score_value(f32::NAN), serde_json::json!(0.0));
+        assert_eq!(
+            safe_robot_score_value(f32::INFINITY),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            safe_robot_score_value(f32::NEG_INFINITY),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(safe_robot_score_value(1.25), serde_json::json!(1.25));
+    }
+
+    #[test]
+    fn projected_hit_score_never_serializes_to_null() {
+        let projected = projected_hit_field_value(&test_hit(f32::NAN), "score");
+        assert_eq!(projected, Some(serde_json::json!(0.0)));
+    }
+
+    #[test]
+    fn filter_hit_fields_supports_workspace_original_projection() {
+        let mut hit = test_hit(1.0);
+        hit.workspace_original = Some("/remote/workspace".to_string());
+
+        let filtered = filter_hit_fields(&hit, &Some(vec!["workspace_original".to_string()]));
+        assert_eq!(
+            filtered,
+            serde_json::json!({
+                "workspace_original": "/remote/workspace"
+            })
+        );
+    }
+
+    #[test]
+    fn projected_hit_field_value_normalizes_blank_local_source_id() {
+        let mut hit = test_hit(1.0);
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "local".to_string();
+
+        let projected = projected_hit_field_value(&hit, "source_id");
+        assert_eq!(projected, Some(serde_json::json!("local")));
+    }
+
+    #[test]
+    fn filter_hit_fields_normalizes_blank_local_source_id_in_full_output() {
+        let mut hit = test_hit(1.0);
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "local".to_string();
+        hit.origin_host = Some("   ".to_string());
+
+        let filtered = filter_hit_fields(&hit, &None);
+        assert_eq!(filtered["source_id"], serde_json::json!("local"));
+        assert!(filtered.get("origin_host").is_none());
+    }
+
+    #[test]
+    fn normalized_robot_hit_for_output_trims_remote_origin_host() {
+        let mut hit = test_hit(1.0);
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("  laptop-01  ".to_string());
+
+        let normalized = normalized_robot_hit_for_output(&hit);
+        assert_eq!(normalized.source_id, "work-laptop");
+        assert_eq!(normalized.origin_host.as_deref(), Some("laptop-01"));
+    }
+
+    #[test]
+    fn filter_hit_fields_normalizes_blank_local_origin_kind_in_full_output() {
+        let mut hit = test_hit(1.0);
+        hit.source_id = "local".to_string();
+        hit.origin_kind = "   ".to_string();
+
+        let filtered = filter_hit_fields(&hit, &None);
+        assert_eq!(filtered["origin_kind"], serde_json::json!("local"));
     }
 }
 
@@ -13723,7 +20012,10 @@ fn format_as_markdown(
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         match role.as_str() {
@@ -13788,7 +20080,10 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         text.push_str(&format!("=== {} ===\n\n", role.to_uppercase()));
@@ -13828,7 +20123,8 @@ fn format_as_html(
     include_tools: bool,
 ) -> String {
     use chrono::{TimeZone, Utc};
-    let title_str = title.as_deref().unwrap_or("Conversation Export");
+    let title_raw = title.as_deref().unwrap_or("Conversation Export");
+    let title_str = html_escape(title_raw);
     let date_str = start_ts
         .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
@@ -13872,7 +20168,10 @@ fn format_as_html(
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         let role_class = if role == "user" { "user" } else { "assistant" };
@@ -13981,37 +20280,91 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Show messages around a specific line in a session file
-fn run_expand(path: &Path, line: usize, context: usize, json: bool) -> CliResult<()> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    if !path.exists() {
+fn run_expand(
+    path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: Option<&str>,
+    line: usize,
+    context: usize,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass expand")?;
+    }
+    let normalized_source_id = canonical_followup_source_id(source_id);
+    let source_id = normalized_source_id.as_deref();
+    if line == 0 {
         return Err(CliError {
-            code: 3,
-            kind: "file-not-found",
-            message: format!("Session file not found: {}", path.display()),
-            hint: Some("Use 'cass search' to find session paths".to_string()),
+            code: 2,
+            kind: "invalid-line",
+            message: "Line numbers start at 1, not 0".to_string(),
+            hint: Some("Use -n 1 for the first line".to_string()),
             retryable: false,
         });
     }
 
-    let file = File::open(path).map_err(|e| CliError {
-        code: 9,
-        kind: "file-open",
-        message: format!("Failed to open file: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let indexed_view = try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id);
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
 
-    let reader = BufReader::new(file);
+    let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);
+
+    let raw_lines: Vec<String> = if prefer_direct_file {
+        match read_followup_file_lines(path) {
+            Ok(lines) => lines,
+            Err(err) => {
+                if let Some(view) = indexed_view.as_ref() {
+                    serialize_indexed_view_lines(view)?
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    } else if let Some(view) = indexed_view.as_ref() {
+        serialize_indexed_view_lines(view)?
+    } else if allow_direct_file && path.exists() {
+        return Err(CliError {
+            code: 9,
+            kind: "indexed-session-required",
+            message: format!(
+                "Local expand for '{}' requires an indexed conversation or a JSONL session",
+                path.display()
+            ),
+            hint: Some(
+                "Run 'cass index --full' first, or expand directly from a JSONL session."
+                    .to_string(),
+            ),
+            retryable: false,
+        });
+    } else {
+        return Err(CliError {
+            code: 3,
+            kind: "file-not-found",
+            message: match source_id {
+                Some(source_id) => format!(
+                    "No indexed session found for source '{}' at {}",
+                    source_id,
+                    path.display()
+                ),
+                None => format!("Session file not found: {}", path.display()),
+            },
+            hint: Some(match source_id {
+                Some(_) => "Use the exact source_id from search output or omit --source to prefer the local file/path.".to_string(),
+                None => "Use 'cass search' to find session paths".to_string(),
+            }),
+            retryable: false,
+        });
+    };
+
     let mut messages: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut target_msg_idx: Option<usize> = None;
     let mut current_line: usize = 0;
 
-    for raw_line in reader.lines().map_while(Result::ok) {
+    for raw_line in raw_lines {
         current_line += 1;
         if raw_line.trim().is_empty() {
             continue;
@@ -14056,12 +20409,7 @@ fn run_expand(path: &Path, line: usize, context: usize, json: bool) -> CliResult
         })
         .collect();
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -14207,9 +20555,6 @@ fn extract_role(msg: &serde_json::Value) -> String {
 }
 
 /// Strip redundant "[Tool: X]" markers from content when tool call is shown separately.
-///
-/// When a message has a tool_call object that's rendered as a collapsible section,
-/// including the "[Tool: X]" text in the content is redundant and looks bad.
 fn strip_tool_marker(content: &str) -> String {
     let trimmed = content.trim();
 
@@ -14247,8 +20592,11 @@ fn smart_truncate(s: &str, max_len: usize) -> String {
     }
 
     // Look for last word boundary (space)
-    let last_idx = char_indices.last().map(|(i, _)| *i).unwrap_or(0);
-    let truncated = &s[..=last_idx];
+    let end_byte = char_indices
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let truncated = &s[..end_byte];
 
     // Find last space to break at word boundary
     if let Some(last_space) = truncated.rfind(|c: char| c.is_whitespace())
@@ -14271,7 +20619,7 @@ fn run_timeline(
     agents: &[String],
     data_dir: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    json: bool,
+    output_format: Option<RobotFormat>,
     group_by: TimelineGrouping,
     source: Option<String>,
 ) -> CliResult<()> {
@@ -14283,11 +20631,15 @@ fn run_timeline(
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
+    let db_path = analytics_db_path(data_dir, db_override.as_ref());
     let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let start_of_day = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("valid start of day");
         let local_start = match Local.from_local_datetime(&start_of_day) {
             chrono::LocalResult::Single(dt) => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
@@ -14304,11 +20656,15 @@ fn run_timeline(
         (start, end)
     };
 
+    // LEFT JOIN + COALESCE on agents so timeline reporting doesn't silently
+    // drop legacy conversations with NULL agent_id.  Agent filter becomes
+    // an EXISTS guard against the agents table so it works with the
+    // correlated lookup rather than a joined column.
     let mut sql = String::from(
-        "SELECT c.id, a.slug as agent, c.title, c.started_at, c.ended_at, c.source_path,
-                COUNT(m.id) as message_count, c.source_id, c.origin_host, s.kind as origin_kind
+        "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, c.title, c.started_at, c.ended_at, c.source_path,
+                COUNT(m.id) as message_count, COALESCE(c.source_id, 'local') as source_id, c.origin_host, s.kind as origin_kind
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN sources s ON c.source_id = s.id
          LEFT JOIN messages m ON m.conversation_id = c.id
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
@@ -14317,7 +20673,9 @@ fn run_timeline(
     let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
-        sql.push_str(" AND a.slug IN (");
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (",
+        );
         for (i, agent) in agents.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -14325,26 +20683,12 @@ fn run_timeline(
             sql.push_str(&format!("?{}", params.len() + 1));
             params.push(agent.clone().into());
         }
-        sql.push(')');
+        sql.push_str("))");
     }
 
     // Source filter (P3.2)
     if let Some(ref filter) = source_filter {
-        match filter {
-            SourceFilter::All => {
-                // No filtering needed
-            }
-            SourceFilter::Local => {
-                sql.push_str(" AND c.source_id = 'local'");
-            }
-            SourceFilter::Remote => {
-                sql.push_str(" AND c.source_id != 'local'");
-            }
-            SourceFilter::SourceId(id) => {
-                sql.push_str(&format!(" AND c.source_id = ?{}", params.len() + 1));
-                params.push(id.clone().into());
-            }
-        }
+        append_source_filter_condition(&mut sql, &mut params, filter);
     }
 
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
@@ -14384,13 +20728,9 @@ fn run_timeline(
         Option<String>,
         Option<String>,
     )> = rows;
+    close_franken_cli_read_db(conn, &db_path, "timeline")?;
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -14416,18 +20756,28 @@ fn run_timeline(
                             origin_host,
                             origin_kind,
                         )| {
-                            let duration = ended.map(|e| e - started);
-                            // Use "local" as default origin_kind if not in DB (backward compat)
-                            let kind = origin_kind.as_deref().unwrap_or("local");
+                            let duration_ms = ended.map(|e| e - started);
+                            let duration_secs = duration_ms.map(|ms| ms / 1000);
+                            let normalized_source_id = normalized_provenance_source_id(
+                                source_id,
+                                origin_kind.as_deref(),
+                                origin_host.as_deref(),
+                            );
+                            let normalized_origin_kind = normalized_provenance_origin_kind(
+                                normalized_source_id.as_str(),
+                                origin_kind.as_deref(),
+                            );
+                            let normalized_origin_host =
+                                normalized_provenance_origin_host(origin_host.as_deref());
                             serde_json::json!({
                                 "id": id, "agent": agent, "title": title,
                                 "started_at": started, "ended_at": ended,
-                                "duration_seconds": duration, "source_path": path,
+                                "duration_seconds": duration_secs, "source_path": path,
                                 "message_count": msg_count,
                                 // Provenance fields (P3.5)
-                                "source_id": source_id,
-                                "origin_kind": kind,
-                                "origin_host": origin_host,
+                                "source_id": normalized_source_id,
+                                "origin_kind": normalized_origin_kind,
+                                "origin_host": normalized_origin_host,
                             })
                         },
                     )
@@ -14462,16 +20812,25 @@ fn run_timeline(
                         TimelineGrouping::Day => dt.format("%Y-%m-%d").to_string(),
                         _ => unreachable!(),
                     };
-                    // Use "local" as default origin_kind if not in DB (backward compat)
-                    let kind = origin_kind.as_deref().unwrap_or("local");
+                    let normalized_source_id = normalized_provenance_source_id(
+                        source_id,
+                        origin_kind.as_deref(),
+                        origin_host.as_deref(),
+                    );
+                    let normalized_origin_kind = normalized_provenance_origin_kind(
+                        normalized_source_id.as_str(),
+                        origin_kind.as_deref(),
+                    );
+                    let normalized_origin_host =
+                        normalized_provenance_origin_host(origin_host.as_deref());
                     groups.entry(key).or_default().push(serde_json::json!({
                         "id": id, "agent": agent, "title": title,
                         "started_at": started, "ended_at": ended,
                         "source_path": path, "message_count": msg_count,
                         // Provenance fields (P3.5)
-                        "source_id": source_id,
-                        "origin_kind": kind,
-                        "origin_host": origin_host,
+                        "source_id": normalized_source_id,
+                        "origin_kind": normalized_origin_kind,
+                        "origin_host": normalized_origin_host,
                     }));
                 }
                 serde_json::json!({
@@ -14517,7 +20876,7 @@ fn run_timeline(
         msg_count,
         source_id,
         origin_host,
-        _origin_kind,
+        origin_kind,
     ) in &sessions
     {
         let dt = Utc
@@ -14561,10 +20920,23 @@ fn run_timeline(
         };
 
         // Source badge for remote sessions (P3.2, P3.5)
-        // Prefer origin_host if available, otherwise use source_id
-        let source_badge = if source_id != "local" {
-            let label = origin_host.as_deref().unwrap_or(source_id.as_str());
-            format!(" [{}]", label)
+        // Prefer origin_host if available, otherwise use normalized source_id.
+        let normalized_source_id = normalized_provenance_source_id(
+            source_id,
+            origin_kind.as_deref(),
+            origin_host.as_deref(),
+        );
+        let source_badge = if normalized_source_id != crate::sources::provenance::LOCAL_SOURCE_ID {
+            let label = origin_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .unwrap_or(normalized_source_id.as_str());
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", label)
+            }
         } else {
             String::new()
         };
@@ -14586,10 +20958,11 @@ fn run_timeline(
 }
 
 /// Handle sources subcommands (P5.x)
-fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
+fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
         SourcesCommand::List { verbose, json } => {
-            run_sources_list(verbose, json)?;
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_list(verbose, structured_format)
         }
         SourcesCommand::Add {
             url,
@@ -14597,14 +20970,11 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
             preset,
             paths,
             no_test,
-        } => {
-            run_sources_add(&url, name, preset, paths, no_test)?;
-        }
-        SourcesCommand::Remove { name, purge, yes } => {
-            run_sources_remove(&name, purge, yes)?;
-        }
+        } => run_sources_add(&url, name, preset, paths, no_test),
+        SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
         SourcesCommand::Doctor { source, json } => {
-            run_sources_doctor(source.as_deref(), json)?;
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_doctor(source.as_deref(), structured_format)
         }
         SourcesCommand::Sync {
             source,
@@ -14613,17 +20983,17 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
             dry_run,
             json,
         } => {
-            run_sources_sync(source, no_index, verbose, dry_run, json)?;
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_sync(source, no_index, verbose, dry_run, structured_format)
         }
-        SourcesCommand::Mappings(action) => {
-            run_mappings_command(action)?;
-        }
+        SourcesCommand::Mappings(action) => run_mappings_command(action, cli),
         SourcesCommand::Discover {
             preset,
             skip_existing,
             json,
         } => {
-            run_sources_discover(&preset, skip_existing, json)?;
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_discover(&preset, skip_existing, structured_format)
         }
         SourcesCommand::Setup {
             dry_run,
@@ -14637,9 +21007,11 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
             verbose,
             json,
         } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let is_robot = structured_format.is_some();
             run_sources_setup(sources::setup::SetupOptions {
                 dry_run,
-                non_interactive: non_interactive || json,
+                non_interactive: non_interactive || is_robot,
                 hosts,
                 skip_install,
                 skip_index,
@@ -14647,15 +21019,14 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
                 timeout,
                 resume,
                 verbose,
-                json,
-            })?;
+                json: is_robot,
+            })
         }
     }
-    Ok(())
 }
 
 /// List configured sources (P5.3)
-fn run_sources_list(verbose: bool, json: bool) -> CliResult<()> {
+fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -14672,12 +21043,7 @@ fn run_sources_list(verbose: bool, json: bool) -> CliResult<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "unknown".into());
 
-    let structured_format = if json {
-        Some(RobotFormat::Json)
-    } else {
-        robot_format_from_env()
-    }
-    .map(|fmt| {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
@@ -14836,7 +21202,7 @@ fn run_sources_add(
     })?;
 
     // Check for duplicate
-    if config.sources.iter().any(|s| s.name == source_id) {
+    if config.find_source(&source_id).is_some() {
         return Err(CliError {
             code: 10,
             kind: "config",
@@ -14935,18 +21301,17 @@ fn parse_source_url(url: &str, name: Option<&str>) -> Result<(String, String), C
         });
     }
 
-    // Generate source_id from hostname if not provided
+    // Generate source_id from hostname if not provided.
+    // Auto-generated remote names must not collide with the built-in local source ID.
     let source_id = if let Some(n) = name {
         n.to_string()
     } else {
         // Extract hostname part (after @)
         let hostname_part = host.split('@').nth(1).unwrap_or(host);
         // Take first segment before any dots
-        hostname_part
-            .split('.')
-            .next()
-            .unwrap_or(hostname_part)
-            .to_string()
+        crate::sources::config::normalize_generated_remote_source_name(
+            hostname_part.split('.').next().unwrap_or(hostname_part),
+        )
     };
 
     Ok((host.to_string(), source_id))
@@ -14995,7 +21360,9 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
 
 /// Remove a configured source (P5.7)
 fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<()> {
+    use crate::sources::SyncStatus;
     use crate::sources::config::SourcesConfig;
+    use colored::Colorize;
 
     // Load existing config
     let mut config = SourcesConfig::load().map_err(|e| CliError {
@@ -15007,7 +21374,8 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     })?;
 
     // Check source exists
-    if !config.sources.iter().any(|s| s.name == name) {
+    let stored_source_name = config.find_source(name).map(|source| source.name.clone());
+    let Some(stored_source_name) = stored_source_name else {
         return Err(CliError {
             code: 13,
             kind: "not_found",
@@ -15015,16 +21383,17 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
         });
-    }
+    };
 
     // Confirmation prompt
     if !skip_confirm {
+        let display_name = &stored_source_name;
         let msg = if purge {
             format!(
-                "Remove source '{name}' and delete indexed data? This cannot be undone. [y/N]: "
+                "Remove source '{display_name}' and delete indexed data? This cannot be undone. [y/N]: "
             )
         } else {
-            format!("Remove source '{name}' from configuration? [y/N]: ")
+            format!("Remove source '{display_name}' from configuration? [y/N]: ")
         };
         print!("{msg}");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -15048,7 +21417,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     }
 
     // Remove from config
-    config.remove_source(name);
+    config.remove_source(&stored_source_name);
     config.save().map_err(|e| CliError {
         code: 11,
         kind: "config",
@@ -15057,13 +21426,34 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
         retryable: false,
     })?;
 
-    println!("Removed '{name}' from configuration.");
+    println!("Removed '{}' from configuration.", stored_source_name);
+
+    let data_dir = default_data_dir();
+    match SyncStatus::load(&data_dir) {
+        Ok(mut sync_status) => {
+            if sync_status.retain_sources(config.sources.iter().map(|source| source.name.as_str()))
+                && let Err(error) = sync_status.save(&data_dir)
+            {
+                eprintln!(
+                    "{} Failed to save pruned sync status: {}",
+                    "Warning:".yellow().bold(),
+                    error
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "{} Failed to load sync status for pruning: {}",
+                "Warning:".yellow().bold(),
+                error
+            );
+        }
+    }
 
     // Handle purge
     if purge {
         // Find and remove synced data directory
-        let data_dir = default_data_dir();
-        let source_dir = data_dir.join("remotes").join(name);
+        let source_dir = data_dir.join("remotes").join(&stored_source_name);
         if source_dir.exists() {
             std::fs::remove_dir_all(&source_dir).map_err(|e| CliError {
                 code: 15,
@@ -15100,8 +21490,11 @@ struct SourceDiagnostics {
 }
 
 /// Diagnose source connectivity and configuration issues (P5.6)
-fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
+fn run_sources_doctor(
+    source_filter: Option<&str>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::sources::config::{SourcesConfig, source_names_equal};
     use colored::Colorize;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -15113,7 +21506,15 @@ fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResu
     })?;
 
     if config.sources.is_empty() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -15132,7 +21533,7 @@ fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResu
     let sources_to_check: Vec<_> = config
         .sources
         .iter()
-        .filter(|s| source_filter.is_none() || source_filter == Some(s.name.as_str()))
+        .filter(|s| source_filter.is_none_or(|filter| source_names_equal(filter, &s.name)))
         .collect();
 
     if sources_to_check.is_empty() {
@@ -15184,7 +21585,15 @@ fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResu
     }
 
     // Output results
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&all_diagnostics).unwrap_or_default()
@@ -15439,9 +21848,9 @@ fn run_sources_sync(
     no_index: bool,
     verbose: bool,
     dry_run: bool,
-    json_output: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
+    use crate::sources::config::{SourcesConfig, source_names_equal};
     use crate::sources::sync::{SyncEngine, SyncReport, SyncStatus};
     use colored::Colorize;
 
@@ -15457,7 +21866,15 @@ fn run_sources_sync(
     let remote_sources: Vec<_> = config.remote_sources().collect();
 
     if remote_sources.is_empty() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -15478,14 +21895,22 @@ fn run_sources_sync(
     let sources_to_sync: Vec<_> = if let Some(ref names) = source_filter {
         remote_sources
             .into_iter()
-            .filter(|s| names.contains(&s.name))
+            .filter(|s| names.iter().any(|name| source_names_equal(name, &s.name)))
             .collect()
     } else {
         remote_sources
     };
 
     if sources_to_sync.is_empty() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -15509,7 +21934,8 @@ fn run_sources_sync(
     // Load existing sync status
     let mut status = SyncStatus::load(&data_dir).unwrap_or_default();
 
-    if dry_run && !json_output {
+    let is_robot = output_format.is_some();
+    if dry_run && !is_robot {
         println!("{}", "DRY RUN - no changes will be made".cyan().bold());
         println!();
     }
@@ -15519,7 +21945,7 @@ fn run_sources_sync(
     let mut total_bytes = 0u64;
 
     for source in &sources_to_sync {
-        if !json_output {
+        if !is_robot {
             println!(
                 "{} {}...",
                 "Syncing".cyan().bold(),
@@ -15529,7 +21955,7 @@ fn run_sources_sync(
 
         if dry_run {
             // In dry run, just show what would be synced
-            if !json_output {
+            if !is_robot {
                 for path in &source.paths {
                     println!("  {} {}", "Would sync:".dimmed(), path);
                 }
@@ -15545,7 +21971,15 @@ fn run_sources_sync(
                 let failed_report = SyncReport::failed(source.name.clone(), e);
                 status.update(&source.name, &failed_report);
 
-                if json_output {
+                let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                    if matches!(fmt, RobotFormat::Sessions) {
+                        RobotFormat::Compact
+                    } else {
+                        fmt
+                    }
+                });
+
+                if let Some(_fmt) = structured_format {
                     all_reports.push(serde_json::json!({
                         "source": source.name,
                         "status": "error",
@@ -15582,7 +22016,15 @@ fn run_sources_sync(
         status.update(&source.name, &report);
 
         // Print results
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             all_reports.push(serde_json::json!({
                 "source": source.name,
                 "status": if report.all_succeeded { "success" } else { "partial" },
@@ -15637,12 +22079,32 @@ fn run_sources_sync(
     }
 
     // Save sync status
-    if !dry_run && let Err(e) = status.save(&data_dir) {
-        tracing::warn!("Failed to save sync status: {}", e);
+    if !dry_run {
+        let current_config = SourcesConfig::load().unwrap_or_else(|error| {
+            tracing::warn!("Failed to reload sources config before saving sync status: {error}");
+            config.clone()
+        });
+        status.retain_sources(
+            current_config
+                .sources
+                .iter()
+                .map(|source| source.name.as_str()),
+        );
+        if let Err(e) = status.save(&data_dir) {
+            tracing::warn!("Failed to save sync status: {}", e);
+        }
     }
 
     // Output summary
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -15659,7 +22121,7 @@ fn run_sources_sync(
 
     // Trigger re-index if requested
     if !no_index && !dry_run && total_files > 0 {
-        if !json_output {
+        if !is_robot {
             println!(
                 "{} {} new files...",
                 "Re-indexing".cyan().bold(),
@@ -15668,7 +22130,7 @@ fn run_sources_sync(
         }
 
         // Call indexer to include synced sessions
-        let progress = if json_output {
+        let progress = if output_format.is_some() {
             ProgressResolved::None
         } else if std::io::stdout().is_terminal() {
             ProgressResolved::Bars
@@ -15682,12 +22144,13 @@ fn run_sources_sync(
             false,          // force_rebuild
             false,          // watch
             None,           // watch_once
+            30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // build_hnsw
             "fastembed".to_string(),
             progress,
-            json_output,
+            output_format,
             None, // idempotency_key
         )?;
     }
@@ -15696,7 +22159,11 @@ fn run_sources_sync(
 }
 
 /// Auto-discover SSH hosts from ~/.ssh/config (P5.6)
-fn run_sources_discover(preset: &str, skip_existing: bool, json_output: bool) -> CliResult<()> {
+fn run_sources_discover(
+    preset: &str,
+    skip_existing: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, discover_ssh_hosts, get_preset_paths};
     use colored::Colorize;
 
@@ -15713,7 +22180,15 @@ fn run_sources_discover(preset: &str, skip_existing: bool, json_output: bool) ->
     let discovered = discover_ssh_hosts();
 
     if discovered.is_empty() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -15745,7 +22220,15 @@ fn run_sources_discover(preset: &str, skip_existing: bool, json_output: bool) ->
     };
 
     if hosts_to_add.is_empty() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::json!({
@@ -15763,7 +22246,15 @@ fn run_sources_discover(preset: &str, skip_existing: bool, json_output: bool) ->
     }
 
     // Output discovered hosts
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         let hosts_json: Vec<_> = hosts_to_add
             .iter()
             .map(|h| {
@@ -15896,9 +22387,12 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
 }
 
 /// Handle models subcommands
-fn run_models_command(cmd: ModelsCommand) -> CliResult<()> {
+fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
-        ModelsCommand::Status { json } => run_models_status(json),
+        ModelsCommand::Status { json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_status(structured_format)
+        }
         ModelsCommand::Install {
             model,
             mirror,
@@ -15916,18 +22410,24 @@ fn run_models_command(cmd: ModelsCommand) -> CliResult<()> {
             repair,
             data_dir,
             json,
-        } => run_models_verify(repair, data_dir, json),
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_verify(repair, data_dir, structured_format)
+        }
         ModelsCommand::Remove {
             model,
             yes,
             data_dir,
         } => run_models_remove(&model, yes, data_dir),
-        ModelsCommand::CheckUpdate { json, data_dir } => run_models_check_update(json, data_dir),
+        ModelsCommand::CheckUpdate { data_dir, json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_check_update(structured_format, data_dir)
+        }
     }
 }
 
 /// Show semantic model installation status
-fn run_models_status(json_output: bool) -> CliResult<()> {
+fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{ModelManifest, ModelState, check_model_installed};
 
@@ -15962,7 +22462,15 @@ fn run_models_status(json_output: bool) -> CliResult<()> {
         }));
     }
 
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         let output = serde_json::json!({
             "model_id": manifest.id,
             "model_dir": model_dir.display().to_string(),
@@ -16088,7 +22596,9 @@ fn run_models_install(
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{ModelDownloader, ModelManifest, check_model_installed};
+    use crate::search::model_download::{
+        ModelDownloader, ModelManifest, check_model_installed, normalize_mirror_base_url,
+    };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -16109,27 +22619,140 @@ fn run_models_install(
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
-
-    // Check if from_file is specified
-    if let Some(file_path) = from_file {
-        return Err(CliError {
+    let mirror_base_url = mirror
+        .map(normalize_mirror_base_url)
+        .transpose()
+        .map_err(|error| CliError {
             code: 21,
             kind: "model",
-            message: format!("--from-file not yet implemented: {}", file_path.display()),
-            hint: Some("Download from HuggingFace instead".into()),
+            message: error.to_string(),
+            hint: Some(
+                "Use an absolute http(s) mirror base URL such as https://mirror.example/cache"
+                    .into(),
+            ),
             retryable: false,
-        });
-    }
+        })?;
 
-    // Check if mirror is specified
-    if let Some(mirror_url) = mirror {
-        return Err(CliError {
-            code: 21,
-            kind: "model",
-            message: format!("--mirror not yet implemented: {}", mirror_url),
-            hint: Some("Download from HuggingFace instead".into()),
+    // Install from local directory (for air-gapped environments)
+    if let Some(source_path) = from_file {
+        use crate::search::model_download::compute_sha256;
+
+        if !source_path.is_dir() {
+            return Err(CliError {
+                code: 21,
+                kind: "model",
+                message: format!(
+                    "--from-file path is not a directory: {}",
+                    source_path.display()
+                ),
+                hint: Some(
+                    "Provide a directory containing model files (model.onnx, tokenizer.json, etc.)"
+                        .into(),
+                ),
+                retryable: false,
+            });
+        }
+
+        println!(
+            "Installing model from local directory: {}",
+            source_path.display()
+        );
+
+        // Verify all required files exist and match checksums
+        for mfile in &manifest.files {
+            let local_name = mfile.local_name();
+            let src = source_path.join(local_name);
+            if !src.is_file() {
+                return Err(CliError {
+                    code: 21,
+                    kind: "model",
+                    message: format!(
+                        "Required file '{}' not found in {}",
+                        local_name,
+                        source_path.display()
+                    ),
+                    hint: Some(format!(
+                        "Expected files: {}",
+                        manifest
+                            .files
+                            .iter()
+                            .map(|f| f.local_name().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    retryable: false,
+                });
+            }
+
+            // Verify SHA256
+            println!("  Verifying {}...", local_name);
+            let actual_hash = compute_sha256(&src).map_err(|e| CliError {
+                code: 22,
+                kind: "io",
+                message: format!("Failed to hash {}: {}", local_name, e),
+                hint: None,
+                retryable: false,
+            })?;
+            if actual_hash != mfile.sha256 {
+                return Err(CliError {
+                    code: 21,
+                    kind: "model",
+                    message: format!(
+                        "SHA256 mismatch for '{}': expected {}, got {}",
+                        local_name, mfile.sha256, actual_hash
+                    ),
+                    hint: Some(
+                        "The file may be corrupted or from a different model version".into(),
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+
+        // All verified -- copy to model directory
+        std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
+            code: 22,
+            kind: "io",
+            message: format!("Failed to create model directory: {}", e),
+            hint: None,
             retryable: false,
-        });
+        })?;
+
+        for mfile in &manifest.files {
+            let local_name = mfile.local_name();
+            let src = source_path.join(local_name);
+            let dst = model_dir.join(local_name);
+            std::fs::copy(&src, &dst).map_err(|e| CliError {
+                code: 22,
+                kind: "io",
+                message: format!("Failed to copy {}: {}", local_name, e),
+                hint: None,
+                retryable: false,
+            })?;
+        }
+
+        // Write verified marker
+        let marker_path = model_dir.join(".verified");
+        let content = format!(
+            "revision={}\nverified_at={}\n",
+            manifest.revision,
+            chrono::Utc::now().to_rfc3339()
+        );
+        std::fs::write(&marker_path, content).map_err(|e| CliError {
+            code: 22,
+            kind: "io",
+            message: format!("Failed to write verified marker: {}", e),
+            hint: None,
+            retryable: false,
+        })?;
+
+        println!();
+        println!(
+            "{} Model installed successfully from local files!",
+            "✓".green()
+        );
+        println!("  Location: {}", model_dir.display());
+        return Ok(());
     }
 
     // Check current state
@@ -16150,9 +22773,18 @@ fn run_models_install(
         println!();
         println!("Model:   {} ({})", manifest.id, manifest.license);
         println!("Size:    {:.1} MB", total_size_mb);
-        println!("Source:  HuggingFace ({})", manifest.repo);
+        if let Some(mirror_url) = mirror_base_url.as_deref() {
+            println!("Source:  Mirror ({mirror_url})");
+            println!("Repo:    {}", manifest.repo);
+        } else {
+            println!("Source:  HuggingFace ({})", manifest.repo);
+        }
         println!();
-        println!("This will download the model from HuggingFace.");
+        if mirror_base_url.is_some() {
+            println!("This will download the model from the configured mirror.");
+        } else {
+            println!("This will download the model from HuggingFace.");
+        }
         print!("Continue? [y/N] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
@@ -16190,12 +22822,15 @@ fn run_models_install(
     let downloader = ModelDownloader::new(model_dir.clone());
     let pb_clone = pb.clone();
     let manifest_clone = manifest.clone();
+    let mirror_base_url_clone = mirror_base_url.clone();
 
-    // Run download on a fresh OS thread to avoid nested Tokio runtime drops from reqwest::blocking.
+    // Run download on a fresh OS thread so the model downloader owns its
+    // dedicated asupersync runtime and blocking file writes.
     let result = std::thread::spawn(move || {
-        downloader.download(
+        downloader.download_with_mirror(
             &manifest_clone,
-            Some(Box::new(move |progress| {
+            mirror_base_url_clone.as_deref(),
+            Some(std::sync::Arc::new(move |progress| {
                 pb_clone.set_position(progress.total_bytes);
             })),
         )
@@ -16228,7 +22863,11 @@ fn run_models_install(
                 code: 23,
                 kind: "download",
                 message: format!("Model download failed: {}", e),
-                hint: Some("Check your network connection and try again".into()),
+                hint: Some(if mirror_base_url.is_some() {
+                    "Check your mirror URL, connectivity, and try again".into()
+                } else {
+                    "Check your network connection and try again".into()
+                }),
                 retryable: true,
             })
         }
@@ -16239,7 +22878,7 @@ fn run_models_install(
 fn run_models_verify(
     repair: bool,
     data_dir_override: Option<PathBuf>,
-    json_output: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{ModelManifest, compute_sha256};
@@ -16250,7 +22889,15 @@ fn run_models_verify(
     let manifest = ModelManifest::minilm_v2();
 
     if !model_dir.is_dir() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -16274,7 +22921,8 @@ fn run_models_verify(
     let mut all_valid = true;
     let mut files_to_repair: Vec<&str> = Vec::new();
 
-    if !json_output {
+    let is_robot = output_format.is_some();
+    if !is_robot {
         println!("Verifying model files...");
         println!();
     }
@@ -16309,7 +22957,7 @@ fn run_models_verify(
             "error": error,
         }));
 
-        if !json_output {
+        if !is_robot {
             let status = if valid {
                 "✓".green().to_string()
             } else {
@@ -16330,7 +22978,15 @@ fn run_models_verify(
         }
     }
 
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -16453,7 +23109,10 @@ fn run_models_remove(
 }
 
 /// Check for model updates
-fn run_models_check_update(json_output: bool, data_dir_override: Option<PathBuf>) -> CliResult<()> {
+fn run_models_check_update(
+    output_format: Option<RobotFormat>,
+    data_dir_override: Option<PathBuf>,
+) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
         ModelManifest, ModelState, check_model_installed, check_version_mismatch,
@@ -16467,7 +23126,15 @@ fn run_models_check_update(json_output: bool, data_dir_override: Option<PathBuf>
     let state = check_model_installed(&model_dir);
 
     if !state.is_ready() {
-        if json_output {
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -16494,12 +23161,20 @@ fn run_models_check_update(json_output: bool, data_dir_override: Option<PathBuf>
     // Check for version mismatch
     let update_info = check_version_mismatch(&model_dir, &manifest);
 
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
     if let Some(ModelState::UpdateAvailable {
         current_revision,
         latest_revision,
     }) = update_info
     {
-        if json_output {
+        if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -16523,7 +23198,7 @@ fn run_models_check_update(json_output: bool, data_dir_override: Option<PathBuf>
             println!("To update, run:");
             println!("  cass models install");
         }
-    } else if json_output {
+    } else if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -16545,10 +23220,11 @@ fn run_models_check_update(json_output: bool, data_dir_override: Option<PathBuf>
 }
 
 /// Handle mappings subcommands (P6.3)
-fn run_mappings_command(action: MappingsAction) -> CliResult<()> {
+fn run_mappings_command(action: MappingsAction, cli: &Cli) -> CliResult<()> {
     match action {
         MappingsAction::List { source, json } => {
-            run_mappings_list(&source, json)?;
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_mappings_list(&source, structured_format)?;
         }
         MappingsAction::Add {
             source,
@@ -16573,7 +23249,7 @@ fn run_mappings_command(action: MappingsAction) -> CliResult<()> {
 }
 
 /// List path mappings for a source (P6.3)
-fn run_mappings_list(source_name: &str, json_output: bool) -> CliResult<()> {
+fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -16592,7 +23268,15 @@ fn run_mappings_list(source_name: &str, json_output: bool) -> CliResult<()> {
         retryable: false,
     })?;
 
-    if json_output {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -16876,6 +23560,297 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
                 return Some((now - chrono::Duration::hours(hours)).timestamp_millis());
             }
             None
+        }
+    }
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(unix)]
+fn resolved_daemon_config(
+    socket: Option<PathBuf>,
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+) -> crate::daemon::DaemonConfig {
+    use std::time::Duration;
+
+    let mut config = crate::daemon::DaemonConfig::from_env();
+    if idle_timeout.is_none() && dotenvy::var("CASS_DAEMON_IDLE_TIMEOUT_SECS").is_err() {
+        config.idle_timeout = Duration::from_secs(3600);
+    }
+
+    if let Some(socket_path) = socket {
+        config.socket_path = socket_path;
+    }
+    if let Some(idle_timeout_secs) = idle_timeout {
+        config.idle_timeout = Duration::from_secs(idle_timeout_secs);
+    }
+    if let Some(max_connections) = max_connections {
+        config.max_connections = max_connections;
+    }
+
+    config
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(unix)]
+fn run_daemon(
+    socket: Option<PathBuf>,
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+    data_dir: Option<PathBuf>,
+) -> CliResult<()> {
+    use crate::daemon::{ModelDaemon, ModelManager};
+
+    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    let config = resolved_daemon_config(socket, idle_timeout, max_connections);
+
+    let models = ModelManager::new(&data_dir);
+    let daemon = ModelDaemon::new(config, models);
+
+    daemon.run().map_err(|e| CliError {
+        code: 9,
+        kind: "daemon",
+        message: format!("Daemon failed: {e}"),
+        hint: None,
+        retryable: false,
+    })
+}
+
+#[cfg(all(test, unix))]
+mod daemon_cli_config_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    fn with_env_vars(vars: &[(&str, Option<&str>)], test: impl FnOnce()) {
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), dotenvy::var(key).ok()))
+            .collect();
+
+        for (key, value) in vars {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+
+        test();
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_uses_env_defaults_when_flags_are_absent() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", Some("/tmp/cass-daemon-env.sock")),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", Some("42")),
+                ("CASS_DAEMON_MAX_CONNECTIONS", Some("7")),
+                ("CASS_DAEMON_REQUEST_TIMEOUT_SECS", Some("9")),
+                ("CASS_DAEMON_MEMORY_LIMIT", Some("12345")),
+            ],
+            || {
+                let config = resolved_daemon_config(None, None, None);
+                assert_eq!(
+                    config.socket_path,
+                    PathBuf::from("/tmp/cass-daemon-env.sock")
+                );
+                assert_eq!(config.idle_timeout, Duration::from_secs(42));
+                assert_eq!(config.max_connections, 7);
+                assert_eq!(config.request_timeout, Duration::from_secs(9));
+                assert_eq!(config.memory_limit, 12_345);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_uses_one_hour_idle_default_without_env_or_flags() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", None),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", None),
+                ("CASS_DAEMON_MAX_CONNECTIONS", None),
+            ],
+            || {
+                let config = resolved_daemon_config(None, None, None);
+                assert_eq!(config.idle_timeout, Duration::from_secs(3600));
+                assert_eq!(config.max_connections, 16);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_flags_override_env_selected_fields_only() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", Some("/tmp/cass-daemon-env.sock")),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", Some("42")),
+                ("CASS_DAEMON_MAX_CONNECTIONS", Some("7")),
+                ("CASS_DAEMON_REQUEST_TIMEOUT_SECS", Some("9")),
+            ],
+            || {
+                let config = resolved_daemon_config(
+                    Some(PathBuf::from("/tmp/cass-daemon-cli.sock")),
+                    Some(0),
+                    Some(3),
+                );
+                assert_eq!(
+                    config.socket_path,
+                    PathBuf::from("/tmp/cass-daemon-cli.sock")
+                );
+                assert_eq!(config.idle_timeout, Duration::from_secs(0));
+                assert_eq!(config.max_connections, 3);
+                assert_eq!(config.request_timeout, Duration::from_secs(9));
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod subcommand_robot_output_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn subcommand_json_flags_enable_robot_mode_and_structured_output() {
+        let cases = [
+            vec!["cass", "search", "needle", "--json"],
+            vec!["cass", "index", "--json"],
+            vec!["cass", "health", "--json"],
+            vec!["cass", "sessions", "--json"],
+            vec!["cass", "timeline", "--json"],
+            vec!["cass", "analytics", "status", "--json"],
+            vec![
+                "cass",
+                "pages",
+                "--export-only",
+                "/tmp/export",
+                "--dry-run",
+                "--json",
+            ],
+            vec!["cass", "export-html", "session.jsonl", "--json"],
+            vec!["cass", "sources", "setup", "--json"],
+        ];
+
+        for args in cases {
+            let cli = Cli::try_parse_from(args.clone()).expect("parse command with --json");
+            let command = cli.command.as_ref().expect("command");
+            assert!(
+                is_robot_mode(command, &cli),
+                "expected robot mode for args: {args:?}"
+            );
+
+            let format = match command {
+                Commands::Search { json, .. }
+                | Commands::Index { json, .. }
+                | Commands::Health { json, .. }
+                | Commands::Sessions { json, .. }
+                | Commands::Timeline { json, .. }
+                | Commands::Pages { json, .. }
+                | Commands::ExportHtml { json, .. } => {
+                    resolve_subcommand_structured_format(&cli, *json)
+                }
+                Commands::Analytics(
+                    AnalyticsCommand::Status { common }
+                    | AnalyticsCommand::Tokens { common, .. }
+                    | AnalyticsCommand::Tools { common, .. }
+                    | AnalyticsCommand::AnalyticsModels { common, .. }
+                    | AnalyticsCommand::Rebuild { common, .. }
+                    | AnalyticsCommand::Validate { common, .. },
+                ) => resolve_subcommand_structured_format(&cli, common.json),
+                Commands::Sources(SourcesCommand::Setup { json, .. }) => {
+                    resolve_subcommand_structured_format(&cli, *json)
+                }
+                other => panic!("unexpected command variant for args {args:?}: {other:?}"),
+            };
+
+            assert_eq!(
+                format,
+                Some(RobotFormat::Json),
+                "expected structured JSON output for args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_robot_format_overrides_subcommand_json_format() {
+        let cli = Cli::try_parse_from(["cass", "--robot-format", "jsonl", "index", "--json"])
+            .expect("parse index command");
+        let command = cli.command.as_ref().expect("command");
+
+        let json = match command {
+            Commands::Index { json, .. } => *json,
+            other => panic!("expected index command, got {other:?}"),
+        };
+
+        assert!(is_robot_mode(command, &cli));
+        assert_eq!(
+            resolve_subcommand_structured_format(&cli, json),
+            Some(RobotFormat::Jsonl)
+        );
+    }
+}
+
+#[cfg(test)]
+mod pages_cli_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn include_attachments_flag_hidden_from_pages_help() {
+        // --include-attachments is not yet implemented (config validation rejects it).
+        // The flag is hidden from --help so users don't discover a non-functional feature.
+        // It must still parse when explicitly passed for forward-compatible config files.
+        let cmd = Cli::command();
+        let pages_cmd = cmd
+            .find_subcommand("pages")
+            .expect("pages subcommand must exist");
+        let mut help_buf = Vec::new();
+        pages_cmd.clone().write_help(&mut help_buf).unwrap();
+        let help_text = String::from_utf8(help_buf).unwrap();
+        assert!(
+            !help_text.contains("include-attachments"),
+            "--include-attachments should be hidden from pages help until implemented.\nHelp text:\n{}",
+            help_text,
+        );
+    }
+
+    #[test]
+    fn include_attachments_still_accepted_when_explicitly_passed() {
+        // Even though hidden, the CLI must still accept the flag without a parse error.
+        // Config validation (not CLI parsing) is responsible for rejecting it.
+        let cli = Cli::try_parse_from([
+            "cass",
+            "pages",
+            "--include-attachments",
+            "--export-only",
+            "/tmp/test",
+            "--dry-run",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "--include-attachments must parse even when hidden: {:?}",
+            cli.err()
+        );
+        if let Ok(ref parsed) = cli {
+            if let Some(Commands::Pages {
+                include_attachments,
+                ..
+            }) = &parsed.command
+            {
+                assert!(include_attachments, "flag should be true when passed");
+            } else {
+                panic!("expected Pages command");
+            }
         }
     }
 }

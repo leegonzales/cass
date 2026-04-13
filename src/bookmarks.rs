@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use frankensqlite::Connection;
-use frankensqlite::compat::{BatchExt, ConnectionExt, OptionalExtension, RowExt, TransactionExt};
+use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -158,11 +158,7 @@ impl BookmarkStore {
             ],
         )?;
 
-        let rowid: i64 = self.conn.query_row_map(
-            "SELECT last_insert_rowid()",
-            &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
-        )?;
+        let rowid = self.conn.last_insert_rowid();
         Ok(rowid)
     }
 
@@ -291,7 +287,7 @@ impl BookmarkStore {
             serde_json::from_str(json).context("parsing bookmark JSON")?;
         let mut imported = 0;
 
-        let tx = self.conn.transaction()?;
+        let mut tx = self.conn.transaction()?;
 
         for mut bookmark in bookmarks {
             let line_number = line_number_to_db(bookmark.line_number)?;
@@ -355,10 +351,7 @@ fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::
 
 /// Get the default bookmarks database path
 pub fn default_bookmarks_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search").map_or_else(
-        || PathBuf::from("bookmarks.db"),
-        |dirs| dirs.data_dir().join("bookmarks.db"),
-    )
+    crate::default_data_dir().join("bookmarks.db")
 }
 
 /// SQL schema for bookmarks database

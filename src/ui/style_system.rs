@@ -187,9 +187,7 @@ impl UiThemePreset {
             "synthwave-84" | "synthwave_84" | "synthwave84" | "synthwave" => {
                 Some(Self::Synthwave84)
             }
-            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => {
-                Some(Self::Colorblind)
-            }
+            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => Some(Self::Colorblind),
             _ => None,
         }
     }
@@ -678,6 +676,7 @@ fn breakpoint_name(breakpoint: super::app::LayoutBreakpoint) -> &'static str {
         LB::MediumNarrow => "medium-narrow",
         LB::Medium => "medium",
         LB::Wide => "wide",
+        LB::UltraWide => "ultra-wide",
     }
 }
 
@@ -1069,6 +1068,9 @@ fn env_truthy(value: Option<&str>) -> bool {
     match value {
         Some(raw) => {
             let normalized = raw.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return false;
+            }
             !(normalized == "0"
                 || normalized == "false"
                 || normalized == "off"
@@ -1431,12 +1433,13 @@ fn synthwave_84_theme() -> Theme {
 /// identical to Tokyo Night.
 fn colorblind_theme() -> Theme {
     ThemeBuilder::from_theme(tokyo_night_theme())
-        // success → teal-cyan (distinct from the blue primary)
-        .success(Color::rgb(125, 207, 255)) // #7dcfff cyan (was green #73daca)
-        // warning → warm yellow (was amber, still yellow family but brighter)
-        .warning(Color::rgb(224, 175, 104)) // #e0af68 (unchanged, already CB-safe)
-        // error → light magenta instead of red (distinct from accent_alt #bb9af7)
-        .error(Color::rgb(208, 154, 247)) // #d09af7 (was red #f7768e)
+        .primary(Color::rgb(0, 114, 178))
+        .secondary(Color::rgb(204, 121, 167))
+        .accent(Color::rgb(230, 159, 0))
+        .success(Color::rgb(0, 158, 115))
+        .warning(Color::rgb(240, 228, 66))
+        .error(Color::rgb(213, 94, 0))
+        .info(Color::rgb(86, 180, 233))
         .build()
 }
 
@@ -2273,8 +2276,8 @@ mod tests {
         // Verify env_truthy handles edge values correctly.
         assert!(!env_truthy(None), "None → false");
         assert!(
-            env_truthy(Some("")),
-            "empty string → true (not in falsy list)"
+            !env_truthy(Some("")),
+            "empty string → false (treated as unset)"
         );
         assert!(env_truthy(Some("1")), "\"1\" → true");
         assert!(env_truthy(Some("yes")), "\"yes\" → true");

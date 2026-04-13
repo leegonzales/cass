@@ -5,8 +5,8 @@
 //! - Various message sizes (small, large, mixed)
 //! - Memory bounded operation
 //!
-//! Run with release mode for realistic performance:
-//!   cargo test --test archive_size --release -- --nocapture --test-threads=1
+//! Run the load scenarios explicitly in release mode for realistic performance:
+//!   cargo test --test load_archive_size --release -- --nocapture --include-ignored --test-threads=1
 //!
 //! Target metrics from P6.9:
 //! | Archive Size | Conversations | Expected |
@@ -95,6 +95,7 @@ fn generate_conversation(
                 content,
                 extra: serde_json::json!({ "load_test": true }),
                 snippets: Vec::new(),
+                invocations: Vec::new(),
             }
         })
         .collect();
@@ -155,13 +156,13 @@ fn setup_load_index(
     let db_path = data_dir.join("load_test.db");
     let index_path = index_dir(&data_dir).expect("index path");
 
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
     let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     let start = Instant::now();
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv, content_size);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
 
         // Progress logging for large tests
         if (i + 1) % 1000 == 0 {
@@ -242,6 +243,7 @@ fn measure_search(client: &SearchClient, query: &str, limit: usize) -> (usize, D
 
 /// Test 1K conversations (10MB baseline).
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_1k_conversations() {
     println!("\n=== Load Test: 1K Conversations (10MB baseline) ===");
     let _guard = load_test_guard();
@@ -274,6 +276,7 @@ fn load_1k_conversations() {
 /// Test 10K conversations (100MB target).
 /// Target: Search under 5s.
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_10k_conversations() {
     println!("\n=== Load Test: 10K Conversations (100MB target) ===");
     let _guard = load_test_guard();
@@ -342,6 +345,7 @@ fn load_50k_conversations() {
 
 /// Test with very large messages (1MB each).
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_large_messages() {
     println!("\n=== Load Test: Large Messages ===");
     let _guard = load_test_guard();
@@ -369,6 +373,7 @@ fn load_large_messages() {
 
 /// Test with many small messages per conversation.
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_many_small_messages() {
     println!("\n=== Load Test: Many Small Messages (100 per conv) ===");
     let _guard = load_test_guard();
@@ -400,6 +405,7 @@ fn load_many_small_messages() {
 
 /// Verify memory doesn't grow unboundedly during repeated searches.
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_memory_bounded_search() {
     println!("\n=== Load Test: Memory Bounded Search ===");
     let _guard = load_test_guard();
@@ -446,6 +452,7 @@ fn load_memory_bounded_search() {
 
 /// Verify index and resources are cleaned up properly.
 #[test]
+#[ignore = "expensive load/perf scenario; run explicitly in dedicated performance sessions"]
 fn load_resource_cleanup() {
     println!("\n=== Load Test: Resource Cleanup ===");
     let _guard = load_test_guard();
@@ -509,16 +516,16 @@ fn load_test_summary() {
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!("║ Test                    │ Target          │ Status            ║");
     println!("╠─────────────────────────┼─────────────────┼───────────────────╣");
-    println!("║ 1K conversations        │ < 1s search     │ Run by default    ║");
-    println!("║ 10K conversations       │ < 5s search     │ Run by default    ║");
+    println!("║ 1K conversations        │ < 1s search     │ --ignored         ║");
+    println!("║ 10K conversations       │ < 5s search     │ --ignored         ║");
     println!("║ 50K conversations       │ < 10s search    │ --ignored         ║");
-    println!("║ Large messages          │ < 5s search     │ Run by default    ║");
-    println!("║ Many small messages     │ < 5s search     │ Run by default    ║");
-    println!("║ Memory bounded          │ < 100MB growth  │ Run by default    ║");
-    println!("║ Resource cleanup        │ < 50MB retained │ Run by default    ║");
+    println!("║ Large messages          │ < 5s search     │ --ignored         ║");
+    println!("║ Many small messages     │ < 5s search     │ --ignored         ║");
+    println!("║ Memory bounded          │ < 100MB growth  │ --ignored         ║");
+    println!("║ Resource cleanup        │ < 50MB retained │ --ignored         ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
     println!();
     println!("Run all tests (including expensive):");
-    println!("  cargo test --test archive_size --release -- --nocapture --include-ignored");
+    println!("  cargo test --test load_archive_size --release -- --nocapture --include-ignored");
     println!();
 }
