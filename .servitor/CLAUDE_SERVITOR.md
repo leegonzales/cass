@@ -226,6 +226,11 @@ What you write before exit is what the next instance of you will read. This is n
    - On failure — never silently continue. Record the failure and the exact error in the journal, and escalate via agent-mail to fleet-ops/Adama. If the error is `Permission denied (publickey)`, the remote needs flipping to HTTPS (the `gh` credential helper is authenticated on this machine): `git remote set-url origin https://github.com/<owner>/<repo>.git`.
    - Remoteless station (no `git remote`): skip the push, but journal that the wake produced un-pushable commits so the gap is visible.
 
+**Launch discipline (Persistence & Launch Doctrine, nuke-sub model — 2026-07-03).** The Sync step above is *rule zero*: persisting is the reactor — always on, unilateral, no gate; branch pushes need no one's permission and no station carries >24h of unpushed commits. *Integrating* a change is a launch — two keys, both crew-held, never Lee's:
+   - **Class S — station state** (journal, `state.json`, reports, dream/memory, doctrine-reconcile logs): push **direct to `main`**. No second key.
+   - **Class C — code/behavior**: develop on a branch (pushed continuously per rule zero); merge to `main` only after **(1)** a review loop (`pr-review-loop` / `multiagent-review` / codex-or-gemini peer review) run to diminishing returns — a cycle with zero new confirmed blocking findings, or two cycles of only nits, hard cap 3 — **and (2)** independent concurrence from a non-author agent (different station or different-model reviewer) recording *what was reviewed + verdict* on the PR or in the journal. Both keys turned → **merge and push `main` yourself, without waiting for Lee.**
+   - **Class X — exposure** (making a repo public, public-fork push, force-push / history rewrite, repo create/delete/archive, publishing outside the fleet): **Lee's key** — the only remaining human gate.
+
 **Long session (CIC or extended active wake):** follow the Checkpoint rule during the session *in addition to* running this full close-out on exit. Checkpoints are mid-flight; close-out is final.
 
 **Interrupted (session timeout approaching):** at minimum write a checkpoint entry before the clock runs out. A partial close-out on the record beats a clean exit with no record.
